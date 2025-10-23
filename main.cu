@@ -373,6 +373,10 @@ struct DeviceContext {
     // Device-side scalars for AllReduce and temporary computations
     double* d_scalar_host_ptr; // Pinned host memory for host-device transfers
     double* d_scalar_device; // Device memory for cuBLAS operations
+    
+    // cuSPARSE work buffer for SpMV operations
+    void* d_spmv_buffer;
+    size_t spmv_buffer_size;
 
     DeviceContext(int dev_id) : 
         device_id(dev_id), 
@@ -382,7 +386,8 @@ struct DeviceContext {
         matA_descr(nullptr), vec_v_descr(nullptr), vec_q_descr(nullptr), vec_w_descr(nullptr), vec_y_descr(nullptr),
         d_V_m(nullptr), d_q(nullptr), d_q_full(nullptr), d_w(nullptr), d_y(nullptr),
         d_ghost_send_buffer(nullptr),
-        d_scalar_host_ptr(nullptr), d_scalar_device(nullptr)
+        d_scalar_host_ptr(nullptr), d_scalar_device(nullptr),
+        d_spmv_buffer(nullptr), spmv_buffer_size(0)
     {
         d_ghost_recv_buffer[0] = nullptr;
         d_ghost_recv_buffer[1] = nullptr;
@@ -402,6 +407,10 @@ struct DeviceContext {
         CHECK_CUDA(cudaStreamCreate(&stream_compute));
         CHECK_CUDA(cudaStreamCreate(&stream_comm));
         CHECK_CUDA(cudaStreamCreate(&stream_reduce));
+        
+        // Set streams for cuBLAS and cuSPARSE handles
+        CHECK_CUBLAS(cublasSetStream(cublas_handle, stream_compute));
+        CHECK_CUSPARSE(cusparseSetStream(cusparse_handle, stream_compute));
     }
 
     // Allocate device memory and copy CSR partition from host
@@ -453,6 +462,14 @@ struct DeviceContext {
         CHECK_CUSPARSE(cusparseCreateDnVec(&vec_q_descr, global_cols, d_q_full, CUDA_R_64F));
         CHECK_CUSPARSE(cusparseCreateDnVec(&vec_w_descr, local_rows, d_w, CUDA_R_64F));
         CHECK_CUSPARSE(cusparseCreateDnVec(&vec_y_descr, local_rows, d_y, CUDA_R_64F));
+        
+        // Query and allocate buffer size for SpMV operations
+        const double alpha = 1.0, beta = 0.0;
+        CHECK_CUSPARSE(cusparseSpMV_bufferSize(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                               &alpha, matA_descr, vec_q_descr, &beta, vec_w_descr,
+                                               CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &spmv_buffer_size));
+        CHECK_CUDA(cudaMalloc(&d_spmv_buffer, spmv_buffer_size));
+        std::cout << "  GPU " << device_id << " SpMV buffer size: " << spmv_buffer_size << " bytes" << std::endl;
 
         // For ghost data, we need buffers. total_recv_size and total_send_size are from GhostMap
         if (ghost_map.total_recv_size > 0) {
@@ -494,6 +511,7 @@ struct DeviceContext {
 
         if (d_scalar_host_ptr) CHECK_CUDA(cudaFreeHost(d_scalar_host_ptr));
         if (d_scalar_device) CHECK_CUDA(cudaFree(d_scalar_device));
+        if (d_spmv_buffer) CHECK_CUDA(cudaFree(d_spmv_buffer));
 
         if (stream_compute) CHECK_CUDA(cudaStreamDestroy(stream_compute));
         if (stream_comm) CHECK_CUDA(cudaStreamDestroy(stream_comm));
@@ -565,6 +583,7 @@ struct ArnoldiRunner {
     Eigen::MatrixXd H_m; // Hessenberg matrix
     Eigen::VectorXd e1;  // First canonical basis vector
     Eigen::VectorXd wH;  // exp(t*H_m)*e1
+    double v_norm;       // Norm of initial vector v (before normalization)
 
     // Global matrix dimensions
     int global_rows;
@@ -709,11 +728,30 @@ struct ArnoldiRunner {
                                        dc.stream_compute));
             CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute)); // Ensure copy is done before norm
 
-            double local_norm_sq = 0.0;
-            // Calculate local norm squared
-            CHECK_CUBLAS(cublasDnrm2(dc.cublas_handle, dc.local_rows, dc.d_q, 1, &local_norm_sq));
-            local_norm_sq = local_norm_sq * local_norm_sq; // Square the norm
+            // Debug: Check first few elements of d_q
+            if (i == 0) {
+                std::vector<double> first_elements(10);
+                CHECK_CUDA(cudaMemcpy(first_elements.data(), dc.d_q, sizeof(double) * 10, cudaMemcpyDeviceToHost));
+                std::cout << "    GPU " << i << " d_q[0:5] = " << first_elements[0] << ", " << first_elements[1] << ", " << first_elements[2] << ", " << first_elements[3] << ", " << first_elements[4] << std::endl;
+            }
+
+            double local_norm = 0.0;
+            // Calculate local norm (temporarily use default stream for HOST pointer mode)
+            CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
+            CHECK_CUBLAS(cublasDnrm2(dc.cublas_handle, dc.local_rows, dc.d_q, 1, &local_norm));
+            CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
+            
+            double local_norm_sq = local_norm * local_norm; // Square the norm
             local_v_norms_squared[i] = local_norm_sq;
+            
+            // Debug: Manually calculate expected norm
+            if (i == 0) {
+                double expected_norm_sq = dc.local_rows * 0.1 * 0.1; // All elements are 0.1
+                double expected_norm = std::sqrt(expected_norm_sq);
+                std::cout << "    GPU " << i << ": local_norm = " << local_norm << " (expected: " << expected_norm << "), local_norm_sq = " << local_norm_sq << " (expected: " << expected_norm_sq << ")" << std::endl;
+            } else {
+                std::cout << "    GPU " << i << ": local_norm = " << local_norm << ", local_norm_sq = " << local_norm_sq << std::endl;
+            }
         }
 
         // AllReduce sum of local_v_norms_squared to get global_norm_sq
@@ -739,6 +777,10 @@ struct ArnoldiRunner {
         CHECK_CUDA(cudaMemcpy(&global_norm_sq, device_contexts[0].d_scalar_host_ptr, sizeof(double), cudaMemcpyDeviceToHost));
 
         double global_norm = std::sqrt(global_norm_sq);
+        
+        // Store the norm of the original vector v (before normalization)
+        v_norm = global_norm;
+        std::cout << "  Initial vector norm ||v|| = " << v_norm << std::endl;
 
         // Scale d_q on each device
         const double alpha = 1.0 / global_norm;
@@ -746,6 +788,16 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaSetDevice(i));
             DeviceContext& dc = device_contexts[i];
             CHECK_CUBLAS(cublasDscal(dc.cublas_handle, dc.local_rows, &alpha, dc.d_q, 1));
+            
+            // Copy q1 to V_m[0] (first column of Arnoldi basis)
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_V_m, dc.d_q, sizeof(double) * dc.local_rows, 
+                                       cudaMemcpyDeviceToDevice, dc.stream_compute));
+        }
+        
+        // Synchronize to ensure q1 is copied to V_m[0]
+        for (int i = 0; i < num_gpus; ++i) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
+            CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute));
         }
     }
 
@@ -811,64 +863,167 @@ struct ArnoldiRunner {
         }
     }
 
-    void gather_q_full() {
-        // Gather full vector q from all GPUs into d_q_full on each GPU
+    void gather_qj_from_Vm(int j) {
+        // Gather full vector q_j from V_m[j] into d_q_full on each GPU
         // This is needed because SpMV requires the full vector (size global_cols)
+        
+        std::cout << "    gather_qj_from_Vm: j=" << j << ", reading V_m[" << j << "]" << std::endl;
+        
+        // Validate j is in bounds
+        if (j < 0 || j > params.m) {
+            std::cerr << "ERROR: gather_qj_from_Vm called with j=" << j << ", but valid range is [0.." << params.m << "]" << std::endl;
+            exit(EXIT_FAILURE);
+        }
         
         for (int dst_gpu = 0; dst_gpu < num_gpus; ++dst_gpu) {
             CHECK_CUDA(cudaSetDevice(device_contexts[dst_gpu].device_id));
             DeviceContext& dst_dc = device_contexts[dst_gpu];
             
+            // Check if d_q_full was allocated
+            if (!dst_dc.d_q_full) {
+                std::cerr << "ERROR: d_q_full is NULL on GPU " << dst_gpu << "!" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            
+            // Debug: print size being zeroed
+            if (j < 5 && dst_gpu == 0) {
+                std::cout << "      Zeroing d_q_full: size=" << global_cols << " doubles (" << (global_cols * sizeof(double)) << " bytes)" << std::endl;
+            }
+            
             // Zero out d_q_full first
             CHECK_CUDA(cudaMemsetAsync(dst_dc.d_q_full, 0, sizeof(double) * global_cols, dst_dc.stream_compute));
             
-            // Copy local and remote parts into d_q_full
+            // Copy local and remote parts from V_m[j] into d_q_full
             for (int src_gpu = 0; src_gpu < num_gpus; ++src_gpu) {
                 DeviceContext& src_dc = device_contexts[src_gpu];
                 int src_offset = get_global_row_offset(src_gpu);
                 int src_size = src_dc.local_rows;
                 
+                // Pointer to V_m[j] on src_gpu
+                double* d_qj_src = src_dc.d_V_m + j * src_dc.local_rows;
+                
+                // Debug: print addresses for first few iterations
+                if (dst_gpu == 0 && src_gpu == 0 && j < 5) {
+                    std::cout << "      GPU " << dst_gpu << " gathering from V_m[" << j << "]:" << std::endl;
+                    std::cout << "        d_V_m=" << (void*)src_dc.d_V_m << std::endl;
+                    std::cout << "        offset=" << (j * src_dc.local_rows) << " elements" << std::endl;
+                    std::cout << "        d_qj_src=" << (void*)d_qj_src << std::endl;
+                    std::cout << "        copying " << src_size << " doubles (" << (src_size * sizeof(double)) << " bytes)" << std::endl;
+                }
+                
                 if (dst_gpu == src_gpu) {
-                    // Local copy
-                    CHECK_CUDA(cudaMemcpyAsync(dst_dc.d_q_full + src_offset, dst_dc.d_q, 
+                    // Local copy from V_m[j]
+                    cudaError_t err = cudaMemcpyAsync(dst_dc.d_q_full + src_offset, d_qj_src, 
                                                sizeof(double) * src_size, 
-                                               cudaMemcpyDeviceToDevice, dst_dc.stream_compute));
+                                               cudaMemcpyDeviceToDevice, dst_dc.stream_compute);
+                    if (err != cudaSuccess) {
+                        std::cerr << "ERROR in cudaMemcpyAsync (local) for j=" << j << ", dst_gpu=" << dst_gpu 
+                                  << ", src_gpu=" << src_gpu << ": " << cudaGetErrorString(err) << std::endl;
+                        std::cerr << "  dst address: " << (void*)(dst_dc.d_q_full + src_offset) << std::endl;
+                        std::cerr << "  src address: " << (void*)d_qj_src << std::endl;
+                        std::cerr << "  size: " << src_size << " doubles" << std::endl;
+                        exit(EXIT_FAILURE);
+                    }
                 } else {
-                    // Peer copy from src_gpu to dst_gpu
-                    CHECK_CUDA(cudaMemcpyPeerAsync(dst_dc.d_q_full + src_offset, dst_gpu,
-                                                   src_dc.d_q, src_gpu,
-                                                   sizeof(double) * src_size, dst_dc.stream_compute));
+                    // Peer copy from V_m[j] on src_gpu to d_q_full on dst_gpu
+                    cudaError_t err = cudaMemcpyPeerAsync(dst_dc.d_q_full + src_offset, dst_gpu,
+                                                   d_qj_src, src_gpu,
+                                                   sizeof(double) * src_size, dst_dc.stream_compute);
+                    if (err != cudaSuccess) {
+                        std::cerr << "ERROR in cudaMemcpyPeerAsync for j=" << j << ", dst_gpu=" << dst_gpu 
+                                  << ", src_gpu=" << src_gpu << ": " << cudaGetErrorString(err) << std::endl;
+                        exit(EXIT_FAILURE);
+                    }
                 }
             }
         }
         
-        // Synchronize all streams
+        // Synchronize all streams - this is where errors from async operations will surface
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-            CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute));
+            cudaError_t err = cudaStreamSynchronize(device_contexts[i].stream_compute);
+            if (err != cudaSuccess) {
+                std::cerr << "ERROR during stream synchronize after gather, GPU " << i << ", j=" << j << ": " << cudaGetErrorString(err) << std::endl;
+                exit(EXIT_FAILURE);
+            }
         }
     }
 
     void spmv_on_off(int j) {
-        std::cout << "  Performing SpMV (on-diag and off-diag)..." << std::endl;
+        std::cout << "  Performing SpMV (on-diag and off-diag)... j=" << j << std::endl;
 
-        // Gather full vector q into d_q_full on all GPUs
-        gather_q_full();
+        // Gather full vector q_j from V_m into d_q_full on all GPUs
+        gather_qj_from_Vm(j);
+        
+        // Debug: check norm of q_j before SpMV
+        if (j < 3) {
+            double q_norm_sq = 0.0;
+            for (int i = 0; i < num_gpus; ++i) {
+                CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
+                DeviceContext& dc = device_contexts[i];
+                double local_norm_sq = 0.0;
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
+                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_q_full, 1, dc.d_q_full, 1, &local_norm_sq));
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
+                q_norm_sq += local_norm_sq;
+            }
+            std::cout << "    DEBUG: ||q_full||^2 before SpMV = " << q_norm_sq << std::endl;
+        }
 
         // Phase 1: Launch on-diag SpMV on all GPUs in parallel
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             
+            // Debug: print pointers before operations
+            if (j < 3) {
+                std::cout << "    DEBUG SpMV setup: GPU " << i << ", j=" << j << std::endl;
+                std::cout << "      d_w=" << (void*)dc.d_w << ", d_q_full=" << (void*)dc.d_q_full << std::endl;
+                std::cout << "      local_rows=" << dc.local_rows << ", local_nnz=" << dc.local_nnz << std::endl;
+            }
+            
             // Zero out d_w before accumulation
-            CHECK_CUDA(cudaMemsetAsync(dc.d_w, 0, sizeof(double) * dc.local_rows, dc.stream_compute));
+            cudaError_t err = cudaMemsetAsync(dc.d_w, 0, sizeof(double) * dc.local_rows, dc.stream_compute);
+            if (err != cudaSuccess) {
+                std::cerr << "ERROR in cudaMemsetAsync for d_w, GPU " << i << ", j=" << j << ": " << cudaGetErrorString(err) << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            
+            // Synchronize memset before SpMV
+            CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute));
+            
+            // Recreate vec_q_descr to ensure it points to current d_q_full
+            // This avoids potential issues with descriptor caching
+            if (dc.vec_q_descr) {
+                CHECK_CUSPARSE(cusparseDestroyDnVec(dc.vec_q_descr));
+            }
+            CHECK_CUSPARSE(cusparseCreateDnVec(&dc.vec_q_descr, global_cols, dc.d_q_full, CUDA_R_64F));
+            
+            // Debug: verify d_q_full is accessible before SpMV
+            if (j < 3) {
+                double first_elem_q = -999.0;
+                cudaError_t err_test = cudaMemcpy(&first_elem_q, dc.d_q_full, sizeof(double), cudaMemcpyDeviceToHost);
+                if (err_test != cudaSuccess) {
+                    std::cerr << "ERROR: Cannot read d_q_full before SpMV! GPU " << i << ", j=" << j << ": " << cudaGetErrorString(err_test) << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+                std::cout << "      d_q_full[0] before SpMV = " << first_elem_q << std::endl;
+            }
             
             // Perform on-diag SpMV: A_on * q_j -> w (partial result)
             if (dc.local_nnz > 0) {
                 const double alpha = 1.0, beta = 0.0;
                 CHECK_CUSPARSE(cusparseSpMV(dc.cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                            &alpha, dc.matA_descr, dc.vec_q_descr, &beta, dc.vec_w_descr,
-                                           CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_scalar_host_ptr));
+                                           CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_spmv_buffer));
+            }
+            
+            // Synchronize and check for errors after SpMV
+            CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute));
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                std::cerr << "ERROR after SpMV on GPU " << i << ", j=" << j << ": " << cudaGetErrorString(err) << std::endl;
+                exit(EXIT_FAILURE);
             }
         }
 
@@ -924,10 +1079,40 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             CHECK_CUDA(cudaEventDestroy(ghost_ready_events[i]));
         }
+        
+        // Debug: check norm of w after SpMV
+        if (j < 3) {
+            double w_norm_sq = 0.0;
+            for (int i = 0; i < num_gpus; ++i) {
+                CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
+                DeviceContext& dc = device_contexts[i];
+                double local_norm_sq = 0.0;
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
+                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, dc.d_w, 1, &local_norm_sq));
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
+                w_norm_sq += local_norm_sq;
+            }
+            std::cout << "    DEBUG: ||w||^2 after SpMV = " << w_norm_sq << std::endl;
+        }
     }
 
     void orthogonalize_mgs(int j) {
-        std::cout << "  Orthogonalizing with MGS..." << std::endl;
+        std::cout << "  Orthogonalizing with MGS... j=" << j << std::endl;
+        
+        // Debug: check w norm before MGS
+        if (j < 3) {
+            double w_norm_sq_before = 0.0;
+            for (int i = 0; i < num_gpus; ++i) {
+                CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
+                DeviceContext& dc = device_contexts[i];
+                double local_norm_sq = 0.0;
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
+                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, dc.d_w, 1, &local_norm_sq));
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
+                w_norm_sq_before += local_norm_sq;
+            }
+            std::cout << "    DEBUG: ||w||^2 BEFORE MGS = " << w_norm_sq_before << std::endl;
+        }
 
         // Modified Gram-Schmidt orthogonalization: w = w - sum_i (h_{i,j} * q_i)
         for (int i = 0; i <= j; ++i) {
@@ -936,6 +1121,18 @@ struct ArnoldiRunner {
             for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
                 CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
                 DeviceContext& dc = device_contexts[gpu_id];
+                
+                // Validate index bounds
+                if (i > j) {
+                    std::cerr << "ERROR: MGS index out of order: i=" << i << " > j=" << j << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+                
+                // Check if V_m[i] exists (should have been filled in iteration i-1, except V_m[0])
+                if (i > params.m) {
+                    std::cerr << "ERROR: Accessing V_m[" << i << "] but m=" << params.m << std::endl;
+                    exit(EXIT_FAILURE);
+                }
                 
                 // Get pointer to q_i (i-th column of V_m)
                 double* d_q_i = dc.d_V_m + i * dc.local_rows;
@@ -949,12 +1146,18 @@ struct ArnoldiRunner {
                     exit(EXIT_FAILURE);
                 }
                 
-                // Use d_scalar_device (device memory) for result, then copy to host
-                CHECK_CUBLAS(cublasSetPointerMode(dc.cublas_handle, CUBLAS_POINTER_MODE_DEVICE));
-                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, d_q_i, 1, dc.d_scalar_device));
-                CHECK_CUBLAS(cublasSetPointerMode(dc.cublas_handle, CUBLAS_POINTER_MODE_HOST));
-                CHECK_CUDA(cudaDeviceSynchronize()); // Sync before copying result
-                CHECK_CUDA(cudaMemcpy(&local_dot, dc.d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
+                // Print debug info for first few iterations
+                if (j < 5 && i == 0) {
+                    std::cout << "    DEBUG: j=" << j << ", i=" << i << ", accessing V_m[" << i << "]" << std::endl;
+                }
+                
+                // Synchronize stream before cublasDdot to ensure d_w and d_q_i are ready
+                CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute));
+                
+                // Temporarily use default stream for cublasDdot with HOST pointer mode
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
+                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, d_q_i, 1, &local_dot));
+                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
                 local_dots[gpu_id] = local_dot;
             }
 
@@ -1009,12 +1212,13 @@ struct ArnoldiRunner {
                     double* d_q_i = dc.d_V_m + i * dc.local_rows;
                     double local_dot = 0.0;
                     
-                    // Use device memory for result
-                    CHECK_CUBLAS(cublasSetPointerMode(dc.cublas_handle, CUBLAS_POINTER_MODE_DEVICE));
-                    CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, d_q_i, 1, dc.d_scalar_device));
-                    CHECK_CUBLAS(cublasSetPointerMode(dc.cublas_handle, CUBLAS_POINTER_MODE_HOST));
-                    CHECK_CUDA(cudaDeviceSynchronize()); // Sync before copying result
-                    CHECK_CUDA(cudaMemcpy(&local_dot, dc.d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
+                    // Synchronize stream before cublasDdot to ensure d_w and d_q_i are ready
+                    CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute));
+                    
+                    // Temporarily use default stream for cublasDdot with HOST pointer mode
+                    CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
+                    CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, d_q_i, 1, &local_dot));
+                    CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
                     local_dots[gpu_id] = local_dot;
                 }
 
@@ -1052,7 +1256,7 @@ struct ArnoldiRunner {
     }
 
     void normalize_new_vector(int j) {
-        std::cout << "  Normalizing new vector..." << std::endl;
+        std::cout << "  Normalizing new vector for j=" << j << ", will store in V_m[" << (j+1) << "]..." << std::endl;
 
         // Phase 1: Compute local norms squared on each GPU
         std::vector<double> local_norms_squared(num_gpus);
@@ -1083,6 +1287,20 @@ struct ArnoldiRunner {
         CHECK_CUDA(cudaMemcpy(&global_norm_squared, device_contexts[0].d_scalar_host_ptr, sizeof(double), cudaMemcpyDeviceToHost));
 
         double global_norm = std::sqrt(global_norm_squared);
+        
+        // Debug: print norm values
+        if (j < 5) {
+            std::cout << "    DEBUG normalize: j=" << j << ", global_norm_sq=" << global_norm_squared 
+                      << ", global_norm=" << global_norm << std::endl;
+        }
+        
+        // Check for zero or invalid norm
+        if (global_norm < 1e-14 || std::isnan(global_norm) || std::isinf(global_norm)) {
+            std::cerr << "ERROR: Invalid norm in normalize_new_vector for j=" << j << std::endl;
+            std::cerr << "  global_norm_squared = " << global_norm_squared << std::endl;
+            std::cerr << "  global_norm = " << global_norm << std::endl;
+            exit(EXIT_FAILURE);
+        }
 
         // Phase 3: Normalize w and store as q_{j+1} (next Arnoldi vector)
         const double alpha = 1.0 / global_norm;
@@ -1097,6 +1315,23 @@ struct ArnoldiRunner {
             double* d_q_next = dc.d_V_m + (j + 1) * dc.local_rows;
             CHECK_CUDA(cudaMemcpyAsync(d_q_next, dc.d_w, sizeof(double) * dc.local_rows, 
                                        cudaMemcpyDeviceToDevice, dc.stream_compute));
+            
+            // Also update d_q for the next iteration (used as working vector)
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_q, dc.d_w, sizeof(double) * dc.local_rows, 
+                                       cudaMemcpyDeviceToDevice, dc.stream_compute));
+        }
+        
+        // Synchronize all GPUs to ensure V_m[j+1] is ready for next iteration
+        for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
+            CHECK_CUDA(cudaDeviceSynchronize());  // Use deviceSync instead of streamSync for stronger guarantee
+            
+            if (j < 5) {  // Debug: verify V_m[j+1] was written
+                double* d_q_next = device_contexts[gpu_id].d_V_m + (j + 1) * device_contexts[gpu_id].local_rows;
+                double first_elem = -999.0;
+                CHECK_CUDA(cudaMemcpy(&first_elem, d_q_next, sizeof(double), cudaMemcpyDeviceToHost));
+                std::cout << "    DEBUG: After normalize, GPU " << gpu_id << ", V_m[" << (j+1) << "][0] = " << first_elem << std::endl;
+            }
         }
 
         // Store h_{j+1,j} = global_norm in H_m
@@ -1124,16 +1359,49 @@ struct ArnoldiRunner {
         e1 = Eigen::VectorXd::Zero(params.m + 1);
         e1(0) = 1.0;
 
-        // Compute exp(t * H_m) using stable matrix exponential
-        Eigen::MatrixXd exp_tH = matrix_exp_stable(params.t * H_m);
+        // DEBUG: Print H_m matrix
+        std::cout << "    H_m matrix (" << H_m.rows() << "x" << H_m.cols() << "):" << std::endl;
+        std::cout << "      H_m(0,0) = " << H_m(0,0) << std::endl;
+        std::cout << "      ||H_m||_F = " << H_m.norm() << std::endl;
+        
+        // DEBUG: Print first few elements of H_m
+        int print_size = std::min(5, (int)H_m.rows());
+        std::cout << "      First " << print_size << "x" << print_size << " block:" << std::endl;
+        for (int i = 0; i < print_size; ++i) {
+            std::cout << "        ";
+            for (int j = 0; j < print_size; ++j) {
+                std::cout << H_m(i,j) << " ";
+            }
+            std::cout << std::endl;
+        }
+
+        // Extract the m x m upper block of H_m (since H_m is (m+1) x m)
+        // We only need the first m rows for the exponential computation
+        Eigen::MatrixXd H_m_square = H_m.block(0, 0, params.m, params.m);
+        
+        std::cout << "      H_m_square is " << H_m_square.rows() << "x" << H_m_square.cols() << std::endl;
+        
+        // Compute exp(t * H_m_square) using stable matrix exponential
+        Eigen::MatrixXd exp_tH_square = matrix_exp_stable(params.t * H_m_square);
+        
+        std::cout << "      exp(t*H_m_square)(0,0) = " << exp_tH_square(0,0) << std::endl;
+        std::cout << "      ||exp(t*H_m_square)||_F = " << exp_tH_square.norm() << std::endl;
+        
+        // Extend to (m+1) x (m+1) for consistency
+        // exp(t*H_m) is approximated by a block structure
+        Eigen::MatrixXd exp_tH = Eigen::MatrixXd::Zero(params.m + 1, params.m + 1);
+        exp_tH.block(0, 0, params.m, params.m) = exp_tH_square;
         
         // Compute wH = exp(t * H_m) * e1
+        // Since e1 has e1(0)=1 and rest=0, we only need the first column of exp_tH
         wH = exp_tH * e1;
+        
+        std::cout << "      wH[0] = " << wH(0) << std::endl;
+        std::cout << "      wH[1] = " << wH(1) << std::endl;
 
         // Phase 2: Lift result back to original space on GPU
-        // y_local = ||v|| * V_m * wH (where ||v|| was computed in init_q1)
-        // For simplicity, we'll assume ||v|| = 1.0 (since we normalized q1)
-        const double v_norm = 1.0; // This should be stored from init_q1
+        // y_local = ||v|| * V_m * wH (where ||v|| was stored in init_q1)
+        std::cout << "      v_norm (from init_q1) = " << v_norm << std::endl;
         
         for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
             CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
@@ -1163,13 +1431,19 @@ struct ArnoldiRunner {
         // Residual-based convergence check: ||r_m|| ≈ |h_{m+1,m}| * ||e_m^T * exp(t*H_m) * e1||
         // where e_m is the m-th canonical basis vector
         
-        // Compute ||e_m^T * exp(t*H_m) * e1||
-        Eigen::VectorXd e_m = Eigen::VectorXd::Zero(params.m + 1);
-        e_m(params.m) = 1.0; // m-th canonical basis vector
+        // Use the m x m block of H_m for exponential
+        Eigen::MatrixXd H_m_square = H_m.block(0, 0, params.m, params.m);
+        Eigen::MatrixXd exp_tH_square = matrix_exp_stable(params.t * H_m_square);
         
-        Eigen::MatrixXd exp_tH = matrix_exp_stable(params.t * H_m);
-        Eigen::VectorXd exp_tH_e1 = exp_tH * e1;
-        double e_m_exp_tH_e1 = e_m.dot(exp_tH_e1);
+        // e1_small is the first canonical basis vector for the m x m system
+        Eigen::VectorXd e1_small = Eigen::VectorXd::Zero(params.m);
+        e1_small(0) = 1.0;
+        
+        // Compute exp(t*H_m_square) * e1_small
+        Eigen::VectorXd exp_tH_e1 = exp_tH_square * e1_small;
+        
+        // e_m is the last canonical basis vector
+        double e_m_exp_tH_e1 = exp_tH_e1(params.m - 1);
         
         // Get h_{m+1,m} from H_m
         double h_m_plus_1_m = H_m(params.m, params.m - 1);
@@ -1222,10 +1496,11 @@ int main() {
         }
 
         // Create a simple test matrix (diagonal matrix for testing)
+        int test_size = 1000; // Full-size test
         CSRHost test_matrix;
-        test_matrix.rows = 1000;
-        test_matrix.cols = 1000;
-        test_matrix.nnz = 1000;
+        test_matrix.rows = test_size;
+        test_matrix.cols = test_size;
+        test_matrix.nnz = test_size;
         
         // Create diagonal matrix
         test_matrix.row_ptr.resize(test_matrix.rows + 1);
@@ -1235,7 +1510,9 @@ int main() {
         for (int i = 0; i < test_matrix.rows; ++i) {
             test_matrix.row_ptr[i] = i;
             test_matrix.col_idx[i] = i;
-            test_matrix.values[i] = 1.0; // Diagonal values
+            // Use different diagonal values to avoid degenerate case
+            // Values range from 1.0 to 2.0
+            test_matrix.values[i] = 1.0 + (double)i / test_matrix.rows;
         }
         test_matrix.row_ptr[test_matrix.rows] = test_matrix.nnz;
 
@@ -1255,7 +1532,8 @@ int main() {
         }
 
         // Set up Arnoldi parameters
-        ArnoldiParams params(50, 1.0, 1e-6, 3, true); // m=50, t=1.0, tol=1e-6, max_restarts=3
+        // Using m=30 for good balance between accuracy and speed
+        ArnoldiParams params(30, 1.0, 1e-6, 3, true); // m=30, t=1.0, tol=1e-6, max_restarts=3
 
         // Create ArnoldiRunner
         ArnoldiRunner runner(num_gpus_to_use, params, test_matrix.rows, test_matrix.cols);
@@ -1265,7 +1543,7 @@ int main() {
         std::cout << "Initialized all devices" << std::endl;
 
         // Create test vector v
-        std::vector<double> v_host(test_matrix.rows, 1.0); // All ones vector
+        std::vector<double> v_host(test_matrix.rows, 0.1); // Initial vector with all elements = 0.1
         std::vector<double> y_host(test_matrix.rows, 0.0); // Result vector
 
         // Compute exp(tA)v
