@@ -70,21 +70,48 @@ if [ ! -f "./build/matrix_exp" ]; then
     fi
 fi
 
-echo "Running matrix exponential computation..."
+echo "Running matrix exponential computation with Nsight Systems profiling..."
 echo "Matrix size: $SIZE"
 echo ""
 
-# Run the program
+# Check if nsys is available
+if ! command -v nsys &> /dev/null; then
+    echo "ERROR: nsys not found. Make sure CUDA module is loaded."
+    exit 1
+fi
+
+echo "Nsight Systems version:"
+nsys --version
+echo ""
+
+# Run the program with nsys profiling
 cd build
-./matrix_exp
+PROFILE_OUTPUT="matrix_exp_profile_\${SLURM_JOB_ID}.nsys-rep"
+echo "Profiling output will be saved to: \$PROFILE_OUTPUT"
+echo ""
+
+nsys profile \\
+    --output="\$PROFILE_OUTPUT" \\
+    --force-overwrite=true \\
+    --trace=cuda,nvtx,osrt \\
+    --stats=true \\
+    --cuda-memory-usage=true \\
+    ./matrix_exp $SIZE
+
+PROFILE_EXIT_CODE=\$?
 
 # Check exit status
-if [ \$? -eq 0 ]; then
+if [ \$PROFILE_EXIT_CODE -eq 0 ]; then
     echo ""
     echo "=== Job completed successfully ==="
+    if [ -f "\$PROFILE_OUTPUT" ]; then
+        echo "Profile report saved: \$PROFILE_OUTPUT"
+        echo "To view the report, use: nsys-ui \$PROFILE_OUTPUT"
+        echo "Or generate a report: nsys stats \$PROFILE_OUTPUT"
+    fi
 else
     echo ""
-    echo "=== Job failed with exit code \$? ==="
+    echo "=== Job failed with exit code \$PROFILE_EXIT_CODE ==="
 fi
 
 echo "End time: \$(date)"
