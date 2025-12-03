@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <cstdlib>
 
 // CUDA includes
 #include <cuda_runtime.h>
@@ -646,15 +647,11 @@ struct ArnoldiRunner {
         // Full procedure: normalize q1 -> Arnoldi restarts -> small exponentiation -> lift -> restart/finish
         // This will be the main orchestration method.
         // Details will be filled in subsequent steps.
-        std::cout << "Computing exp(tA)v..." << std::endl;
-
         // 1. Initialize q1 (norm of v and scale v)
         init_q1(v_host);
 
         // 2. Arnoldi iterations (main loop with restarts)
         for (int restart_count = 0; restart_count < params.max_restarts; ++restart_count) {
-            std::cout << "  Restart " << restart_count + 1 << " of " << params.max_restarts << std::endl;
-
             // Reset H_m for new Arnoldi run
             H_m.setZero(params.m + 1, params.m);
 
@@ -680,10 +677,8 @@ struct ArnoldiRunner {
 
             // F) Evaluate residual and decide on restart
             if (residual_estimate()) {
-                std::cout << "  Converged after " << restart_count + 1 << " restarts." << std::endl;
                 break; // Converged
             } else {
-                std::cout << "  Restarting Arnoldi..." << std::endl;
                 // If not converged, d_y (computed in small_expm_and_lift) becomes the new v for restart
                 // This is handled implicitly as d_y will be used as the new initial vector for the next Arnoldi run
             }
@@ -706,13 +701,10 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute));
         }
 
-        std::cout << "exp(tA)v computation finished." << std::endl;
     }
 
     // Internal methods (details to be implemented)
     void init_q1(const std::vector<double>& v_host) {
-        std::cout << "  Initializing q1..." << std::endl;
-
         std::vector<double> local_v_norms_squared(num_gpus);
 
         for (int i = 0; i < num_gpus; ++i) {
@@ -728,13 +720,6 @@ struct ArnoldiRunner {
                                        dc.stream_compute));
             CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute)); // Ensure copy is done before norm
 
-            // Debug: Check first few elements of d_q
-            if (i == 0) {
-                std::vector<double> first_elements(10);
-                CHECK_CUDA(cudaMemcpy(first_elements.data(), dc.d_q, sizeof(double) * 10, cudaMemcpyDeviceToHost));
-                std::cout << "    GPU " << i << " d_q[0:5] = " << first_elements[0] << ", " << first_elements[1] << ", " << first_elements[2] << ", " << first_elements[3] << ", " << first_elements[4] << std::endl;
-            }
-
             double local_norm = 0.0;
             // Calculate local norm (temporarily use default stream for HOST pointer mode)
             CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
@@ -743,15 +728,6 @@ struct ArnoldiRunner {
             
             double local_norm_sq = local_norm * local_norm; // Square the norm
             local_v_norms_squared[i] = local_norm_sq;
-            
-            // Debug: Manually calculate expected norm
-            if (i == 0) {
-                double expected_norm_sq = dc.local_rows * 0.1 * 0.1; // All elements are 0.1
-                double expected_norm = std::sqrt(expected_norm_sq);
-                std::cout << "    GPU " << i << ": local_norm = " << local_norm << " (expected: " << expected_norm << "), local_norm_sq = " << local_norm_sq << " (expected: " << expected_norm_sq << ")" << std::endl;
-            } else {
-                std::cout << "    GPU " << i << ": local_norm = " << local_norm << ", local_norm_sq = " << local_norm_sq << std::endl;
-            }
         }
 
         // AllReduce sum of local_v_norms_squared to get global_norm_sq
@@ -780,7 +756,6 @@ struct ArnoldiRunner {
         
         // Store the norm of the original vector v (before normalization)
         v_norm = global_norm;
-        std::cout << "  Initial vector norm ||v|| = " << v_norm << std::endl;
 
         // Scale d_q on each device
         const double alpha = 1.0 / global_norm;
@@ -802,7 +777,6 @@ struct ArnoldiRunner {
     }
 
     void ghost_exchange_qj(int j) {
-        std::cout << "  Ghost exchange for q_j..." << std::endl;
 
         // Phase 1: Each GPU gathers its outgoing ghost data into its d_ghost_send_buffer
         for (int i = 0; i < num_gpus; ++i) {
@@ -867,8 +841,6 @@ struct ArnoldiRunner {
         // Gather full vector q_j from V_m[j] into d_q_full on each GPU
         // This is needed because SpMV requires the full vector (size global_cols)
         
-        std::cout << "    gather_qj_from_Vm: j=" << j << ", reading V_m[" << j << "]" << std::endl;
-        
         // Validate j is in bounds
         if (j < 0 || j > params.m) {
             std::cerr << "ERROR: gather_qj_from_Vm called with j=" << j << ", but valid range is [0.." << params.m << "]" << std::endl;
@@ -885,11 +857,6 @@ struct ArnoldiRunner {
                 exit(EXIT_FAILURE);
             }
             
-            // Debug: print size being zeroed
-            if (j < 5 && dst_gpu == 0) {
-                std::cout << "      Zeroing d_q_full: size=" << global_cols << " doubles (" << (global_cols * sizeof(double)) << " bytes)" << std::endl;
-            }
-            
             // Zero out d_q_full first
             CHECK_CUDA(cudaMemsetAsync(dst_dc.d_q_full, 0, sizeof(double) * global_cols, dst_dc.stream_compute));
             
@@ -901,15 +868,6 @@ struct ArnoldiRunner {
                 
                 // Pointer to V_m[j] on src_gpu
                 double* d_qj_src = src_dc.d_V_m + j * src_dc.local_rows;
-                
-                // Debug: print addresses for first few iterations
-                if (dst_gpu == 0 && src_gpu == 0 && j < 5) {
-                    std::cout << "      GPU " << dst_gpu << " gathering from V_m[" << j << "]:" << std::endl;
-                    std::cout << "        d_V_m=" << (void*)src_dc.d_V_m << std::endl;
-                    std::cout << "        offset=" << (j * src_dc.local_rows) << " elements" << std::endl;
-                    std::cout << "        d_qj_src=" << (void*)d_qj_src << std::endl;
-                    std::cout << "        copying " << src_size << " doubles (" << (src_size * sizeof(double)) << " bytes)" << std::endl;
-                }
                 
                 if (dst_gpu == src_gpu) {
                     // Local copy from V_m[j]
@@ -950,37 +908,15 @@ struct ArnoldiRunner {
     }
 
     void spmv_on_off(int j) {
-        std::cout << "  Performing SpMV (on-diag and off-diag)... j=" << j << std::endl;
 
         // Gather full vector q_j from V_m into d_q_full on all GPUs
         gather_qj_from_Vm(j);
         
-        // Debug: check norm of q_j before SpMV
-        if (j < 3) {
-            double q_norm_sq = 0.0;
-            for (int i = 0; i < num_gpus; ++i) {
-                CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-                DeviceContext& dc = device_contexts[i];
-                double local_norm_sq = 0.0;
-                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
-                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_q_full, 1, dc.d_q_full, 1, &local_norm_sq));
-                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
-                q_norm_sq += local_norm_sq;
-            }
-            std::cout << "    DEBUG: ||q_full||^2 before SpMV = " << q_norm_sq << std::endl;
-        }
-
         // Phase 1: Launch on-diag SpMV on all GPUs in parallel
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             
-            // Debug: print pointers before operations
-            if (j < 3) {
-                std::cout << "    DEBUG SpMV setup: GPU " << i << ", j=" << j << std::endl;
-                std::cout << "      d_w=" << (void*)dc.d_w << ", d_q_full=" << (void*)dc.d_q_full << std::endl;
-                std::cout << "      local_rows=" << dc.local_rows << ", local_nnz=" << dc.local_nnz << std::endl;
-            }
             
             // Zero out d_w before accumulation
             cudaError_t err = cudaMemsetAsync(dc.d_w, 0, sizeof(double) * dc.local_rows, dc.stream_compute);
@@ -1080,39 +1016,10 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaEventDestroy(ghost_ready_events[i]));
         }
         
-        // Debug: check norm of w after SpMV
-        if (j < 3) {
-            double w_norm_sq = 0.0;
-            for (int i = 0; i < num_gpus; ++i) {
-                CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-                DeviceContext& dc = device_contexts[i];
-                double local_norm_sq = 0.0;
-                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
-                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, dc.d_w, 1, &local_norm_sq));
-                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
-                w_norm_sq += local_norm_sq;
-            }
-            std::cout << "    DEBUG: ||w||^2 after SpMV = " << w_norm_sq << std::endl;
-        }
     }
 
     void orthogonalize_mgs(int j) {
-        std::cout << "  Orthogonalizing with MGS... j=" << j << std::endl;
         
-        // Debug: check w norm before MGS
-        if (j < 3) {
-            double w_norm_sq_before = 0.0;
-            for (int i = 0; i < num_gpus; ++i) {
-                CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-                DeviceContext& dc = device_contexts[i];
-                double local_norm_sq = 0.0;
-                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, NULL));
-                CHECK_CUBLAS(cublasDdot(dc.cublas_handle, dc.local_rows, dc.d_w, 1, dc.d_w, 1, &local_norm_sq));
-                CHECK_CUBLAS(cublasSetStream(dc.cublas_handle, dc.stream_compute));
-                w_norm_sq_before += local_norm_sq;
-            }
-            std::cout << "    DEBUG: ||w||^2 BEFORE MGS = " << w_norm_sq_before << std::endl;
-        }
 
         // Modified Gram-Schmidt orthogonalization: w = w - sum_i (h_{i,j} * q_i)
         for (int i = 0; i <= j; ++i) {
@@ -1146,10 +1053,6 @@ struct ArnoldiRunner {
                     exit(EXIT_FAILURE);
                 }
                 
-                // Print debug info for first few iterations
-                if (j < 5 && i == 0) {
-                    std::cout << "    DEBUG: j=" << j << ", i=" << i << ", accessing V_m[" << i << "]" << std::endl;
-                }
                 
                 // Synchronize stream before cublasDdot to ensure d_w and d_q_i are ready
                 CHECK_CUDA(cudaStreamSynchronize(dc.stream_compute));
@@ -1256,7 +1159,6 @@ struct ArnoldiRunner {
     }
 
     void normalize_new_vector(int j) {
-        std::cout << "  Normalizing new vector for j=" << j << ", will store in V_m[" << (j+1) << "]..." << std::endl;
 
         // Phase 1: Compute local norms squared on each GPU
         std::vector<double> local_norms_squared(num_gpus);
@@ -1288,11 +1190,6 @@ struct ArnoldiRunner {
 
         double global_norm = std::sqrt(global_norm_squared);
         
-        // Debug: print norm values
-        if (j < 5) {
-            std::cout << "    DEBUG normalize: j=" << j << ", global_norm_sq=" << global_norm_squared 
-                      << ", global_norm=" << global_norm << std::endl;
-        }
         
         // Check for zero or invalid norm
         if (global_norm < 1e-14 || std::isnan(global_norm) || std::isinf(global_norm)) {
@@ -1325,13 +1222,6 @@ struct ArnoldiRunner {
         for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
             CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
             CHECK_CUDA(cudaDeviceSynchronize());  // Use deviceSync instead of streamSync for stronger guarantee
-            
-            if (j < 5) {  // Debug: verify V_m[j+1] was written
-                double* d_q_next = device_contexts[gpu_id].d_V_m + (j + 1) * device_contexts[gpu_id].local_rows;
-                double first_elem = -999.0;
-                CHECK_CUDA(cudaMemcpy(&first_elem, d_q_next, sizeof(double), cudaMemcpyDeviceToHost));
-                std::cout << "    DEBUG: After normalize, GPU " << gpu_id << ", V_m[" << (j+1) << "][0] = " << first_elem << std::endl;
-            }
         }
 
         // Store h_{j+1,j} = global_norm in H_m
@@ -1341,7 +1231,6 @@ struct ArnoldiRunner {
     }
 
     void store_H_column(int j) {
-        std::cout << "  Storing H_m column..." << std::endl;
         
         // The H_m matrix is already being populated during orthogonalize_mgs and normalize_new_vector
         // This method is mainly for logging/debugging purposes
@@ -1352,40 +1241,18 @@ struct ArnoldiRunner {
     }
 
     void small_expm_and_lift() {
-        std::cout << "  Calculating small exponentiation and lifting..." << std::endl;
 
         // Phase 1: Compute small matrix exponential on CPU using Eigen
         // Create e1 vector (first canonical basis vector)
         e1 = Eigen::VectorXd::Zero(params.m + 1);
         e1(0) = 1.0;
 
-        // DEBUG: Print H_m matrix
-        std::cout << "    H_m matrix (" << H_m.rows() << "x" << H_m.cols() << "):" << std::endl;
-        std::cout << "      H_m(0,0) = " << H_m(0,0) << std::endl;
-        std::cout << "      ||H_m||_F = " << H_m.norm() << std::endl;
-        
-        // DEBUG: Print first few elements of H_m
-        int print_size = std::min(5, (int)H_m.rows());
-        std::cout << "      First " << print_size << "x" << print_size << " block:" << std::endl;
-        for (int i = 0; i < print_size; ++i) {
-            std::cout << "        ";
-            for (int j = 0; j < print_size; ++j) {
-                std::cout << H_m(i,j) << " ";
-            }
-            std::cout << std::endl;
-        }
-
         // Extract the m x m upper block of H_m (since H_m is (m+1) x m)
         // We only need the first m rows for the exponential computation
         Eigen::MatrixXd H_m_square = H_m.block(0, 0, params.m, params.m);
         
-        std::cout << "      H_m_square is " << H_m_square.rows() << "x" << H_m_square.cols() << std::endl;
-        
         // Compute exp(t * H_m_square) using stable matrix exponential
         Eigen::MatrixXd exp_tH_square = matrix_exp_stable(params.t * H_m_square);
-        
-        std::cout << "      exp(t*H_m_square)(0,0) = " << exp_tH_square(0,0) << std::endl;
-        std::cout << "      ||exp(t*H_m_square)||_F = " << exp_tH_square.norm() << std::endl;
         
         // Extend to (m+1) x (m+1) for consistency
         // exp(t*H_m) is approximated by a block structure
@@ -1395,13 +1262,9 @@ struct ArnoldiRunner {
         // Compute wH = exp(t * H_m) * e1
         // Since e1 has e1(0)=1 and rest=0, we only need the first column of exp_tH
         wH = exp_tH * e1;
-        
-        std::cout << "      wH[0] = " << wH(0) << std::endl;
-        std::cout << "      wH[1] = " << wH(1) << std::endl;
 
         // Phase 2: Lift result back to original space on GPU
         // y_local = ||v|| * V_m * wH (where ||v|| was stored in init_q1)
-        std::cout << "      v_norm (from init_q1) = " << v_norm << std::endl;
         
         for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
             CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
@@ -1421,12 +1284,9 @@ struct ArnoldiRunner {
                 }
             }
         }
-        
-        std::cout << "    Small exponentiation completed. wH norm: " << wH.norm() << std::endl;
     }
 
     bool residual_estimate() {
-        std::cout << "  Estimating residual..." << std::endl;
         
         // Residual-based convergence check: ||r_m|| ≈ |h_{m+1,m}| * ||e_m^T * exp(t*H_m) * e1||
         // where e_m is the m-th canonical basis vector
@@ -1451,16 +1311,8 @@ struct ArnoldiRunner {
         // Estimate residual norm
         double residual_norm = std::abs(h_m_plus_1_m * e_m_exp_tH_e1);
         
-        std::cout << "    Residual norm estimate: " << residual_norm << " (tolerance: " << params.tol << ")" << std::endl;
-        
         // Check convergence
         bool converged = (residual_norm <= params.tol);
-        
-        if (converged) {
-            std::cout << "    Converged!" << std::endl;
-        } else {
-            std::cout << "    Not converged, restart needed." << std::endl;
-        }
         
         return converged;
     }
@@ -1473,8 +1325,19 @@ struct ArnoldiRunner {
     }
 };
 
-int main() {
+int main(int argc, char* argv[]) {
     std::cout << "Starting matrix_exp application." << std::endl;
+
+    // Parse command-line arguments
+    int test_size = 1000; // Default size
+    if (argc > 1) {
+        test_size = std::atoi(argv[1]);
+        if (test_size <= 0) {
+            std::cerr << "Error: Matrix size must be a positive integer. Using default size 1000." << std::endl;
+            test_size = 1000;
+        }
+    }
+    std::cout << "Matrix size: " << test_size << std::endl;
 
     // Example usage
     try {
@@ -1496,7 +1359,6 @@ int main() {
         }
 
         // Create a simple test matrix (diagonal matrix for testing)
-        int test_size = 1000; // Full-size test
         CSRHost test_matrix;
         test_matrix.rows = test_size;
         test_matrix.cols = test_size;
@@ -1527,8 +1389,6 @@ int main() {
         std::vector<CSRHost::GhostMap> ghost_maps(num_gpus_to_use);
         for (int i = 0; i < num_gpus_to_use; ++i) {
             ghost_maps[i] = test_matrix.build_owner_ghost_maps(partitions, i, num_gpus_to_use);
-            std::cout << "GPU " << i << " ghost map: " << ghost_maps[i].total_send_size 
-                      << " send, " << ghost_maps[i].total_recv_size << " recv" << std::endl;
         }
 
         // Set up Arnoldi parameters
@@ -1540,7 +1400,6 @@ int main() {
         
         // Initialize all devices
         runner.init_all_devices(partitions, device_ids, ghost_maps);
-        std::cout << "Initialized all devices" << std::endl;
 
         // Create test vector v
         std::vector<double> v_host(test_matrix.rows, 0.1); // Initial vector with all elements = 0.1
@@ -1557,7 +1416,6 @@ int main() {
 
         // Clean up
         runner.destroy();
-        std::cout << "Cleanup completed." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
