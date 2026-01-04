@@ -18,6 +18,20 @@ GPUS=2
 TIME="00:05:00"
 SIZE=1000
 MATRIX_FILE=""
+LOG_DIR=${LOG_DIR:-"logs"}
+PROFILE_DIR=${PROFILE_DIR:-"$LOG_DIR/profiles"}
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Resolve paths relative to project root (so they don't end up under build/)
+if [[ "$LOG_DIR" = /* ]]; then
+  LOG_DIR_RES="$LOG_DIR"
+else
+  LOG_DIR_RES="$PROJECT_ROOT/$LOG_DIR"
+fi
+if [[ "$PROFILE_DIR" = /* ]]; then
+  PROFILE_DIR_RES="$PROFILE_DIR"
+else
+  PROFILE_DIR_RES="$PROJECT_ROOT/$PROFILE_DIR"
+fi
 
 # Parse arguments
 # If first argument starts with '--', use named arguments
@@ -82,7 +96,13 @@ if [[ -n "$MATRIX_FILE" ]]; then
 else
     echo "  Matrix size: $SIZE"
 fi
+echo "  Logs dir: $LOG_DIR_RES"
+echo "  Profiles dir: $PROFILE_DIR_RES"
 echo ""
+
+# Ensure log/profile directories exist (submission side)
+mkdir -p "$LOG_DIR_RES"
+mkdir -p "$PROFILE_DIR_RES"
 
 # Create temporary SLURM script
 TEMP_SLURM=$(mktemp)
@@ -95,8 +115,8 @@ cat > "$TEMP_SLURM" << EOF
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:$GPUS
 #SBATCH --time=$TIME
-#SBATCH --output=matrix_exp_%j.out
-#SBATCH --error=matrix_exp_%j.err
+#SBATCH --output=${LOG_DIR_RES}/matrix_exp_%j.out
+#SBATCH --error=${LOG_DIR_RES}/matrix_exp_%j.err
 
 echo "=== Matrix Exponential SLURM Job ==="
 echo "Job ID: \$SLURM_JOB_ID"
@@ -179,8 +199,8 @@ fi
 
 # Run the program with nsys profiling
 cd build
-PROFILE_OUTPUT="matrix_exp_profile_\${SLURM_JOB_ID}.nsys-rep"
-echo "Profiling output will be saved to: \$PROFILE_OUTPUT"
+PROFILE_OUTPUT="${PROFILE_DIR_RES}/matrix_exp_profile_\${SLURM_JOB_ID}"
+echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
 echo ""
 
 nsys profile \\
