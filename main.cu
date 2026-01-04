@@ -18,37 +18,12 @@
 // Eigen for small matrix exponentiation (using only stable modules)
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
+#include <unsupported/Eigen/MatrixFunctions>
 
 // Stable matrix exponential implementation using only core Eigen modules
 Eigen::MatrixXd matrix_exp_stable(const Eigen::MatrixXd& A) {
-    // For small matrices, use eigenvalue decomposition: exp(A) = V * exp(D) * V^(-1)
-    // where A = V * D * V^(-1) is the eigenvalue decomposition
-    
-    Eigen::EigenSolver<Eigen::MatrixXd> solver(A);
-    if (solver.info() != Eigen::Success) {
-        // Fallback to Taylor series for non-diagonalizable matrices
-        Eigen::MatrixXd result = Eigen::MatrixXd::Identity(A.rows(), A.cols());
-        Eigen::MatrixXd term = Eigen::MatrixXd::Identity(A.rows(), A.cols());
-        
-        for (int k = 1; k <= 20; ++k) {  // Taylor series: exp(A) = I + A + A²/2! + A³/3! + ...
-            term = term * A / k;
-            result += term;
-            
-            // Check convergence
-            if (term.norm() < 1e-15) break;
-        }
-        return result;
-    }
-    
-    // Use eigenvalue decomposition
-    Eigen::MatrixXd V = solver.eigenvectors().real();
-    Eigen::VectorXd D = solver.eigenvalues().real();
-    
-    // Compute exp(D) element-wise
-    Eigen::VectorXd exp_D = D.array().exp();
-    
-    // Reconstruct exp(A) = V * diag(exp(D)) * V^(-1)
-    return V * exp_D.asDiagonal() * V.inverse();
+    // Use Eigen's matrix exponential (scaling-squaring + Pade), more stable for non-normal matrices
+    return A.exp();
 }
 
 // Error checking macro
@@ -90,7 +65,7 @@ Eigen::MatrixXd matrix_exp_stable(const Eigen::MatrixXd& A) {
 
 // Global constants
 const double ARNOLDI_TOL = 1e-8; // Tolerance for Arnoldi residual
-const int MAX_RESTARTS = 10;     // Maximum number of restarts
+const int MAX_RESTARTS = 10;     // Default maximum number of restarts
 
 // CSRHost class for host-side matrix handling
 struct CSRHost {
@@ -372,8 +347,8 @@ struct DeviceContext {
     int local_nnz;  // Number of non-zero elements in local CSR partition
 
     // Device-side scalars for AllReduce and temporary computations
-    double* d_scalar_host_ptr; // Pinned host memory for host-device transfers
-    double* d_scalar_device; // Device memory for cuBLAS operations
+    double* d_scalar_host_ptr; // Pinned host scratch for small D2H copies
+    double* d_scalar_device;   // Device buffer used in NCCL AllReduce ops
     
     // cuSPARSE work buffer for SpMV operations
     void* d_spmv_buffer;
@@ -578,6 +553,9 @@ struct ArnoldiRunner {
     std::vector<DeviceContext> device_contexts;
     NcclContext nccl_context;
     ArnoldiParams params;
+    bool converged = false;
+    int restarts_done = 0;
+    double last_residual = 0.0;
     std::vector<CSRHost::GhostMap> ghost_maps;
 
     // Host-side data for small H_m matrix and wH vector
@@ -651,7 +629,9 @@ struct ArnoldiRunner {
         init_q1(v_host);
 
         // 2. Arnoldi iterations (main loop with restarts)
-        for (int restart_count = 0; restart_count < params.max_restarts; ++restart_count) {
+        restarts_done = 0;
+        converged = false;
+        while (true) {
             // Reset H_m for new Arnoldi run
             H_m.setZero(params.m + 1, params.m);
 
@@ -676,12 +656,20 @@ struct ArnoldiRunner {
             small_expm_and_lift();
 
             // F) Evaluate residual and decide on restart
-            if (residual_estimate()) {
+            last_residual = residual_estimate();
+            if (last_residual <= params.tol) {
+                converged = true;
                 break; // Converged
             } else {
                 // If not converged, d_y (computed in small_expm_and_lift) becomes the new v for restart
-                // This is handled implicitly as d_y will be used as the new initial vector for the next Arnoldi run
+                restart_from_y();
             }
+
+            ++restarts_done;
+            if (params.max_restarts > 0 && restarts_done >= params.max_restarts) {
+                break;
+            }
+            // If max_restarts <= 0, run until convergence
         }
 
         // G) Copy final y from device to host
@@ -739,10 +727,10 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             // Copy local norm squared to device
-            CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_host_ptr, &local_v_norms_squared[i], sizeof(double), 
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_device, &local_v_norms_squared[i], sizeof(double), 
                                        cudaMemcpyHostToDevice, dc.stream_reduce));
             // All GPUs participate in AllReduce
-            nccl_context.allreduce_sum(dc.d_scalar_host_ptr, 1, nccl_context.comms[i], dc.stream_reduce);
+            nccl_context.allreduce_sum(dc.d_scalar_device, 1, nccl_context.comms[i], dc.stream_reduce);
         }
         CHECK_NCCL(ncclGroupEnd());
         
@@ -750,7 +738,7 @@ struct ArnoldiRunner {
         double global_norm_sq = 0.0;
         CHECK_CUDA(cudaSetDevice(device_contexts[0].device_id));
         CHECK_CUDA(cudaStreamSynchronize(device_contexts[0].stream_reduce));
-        CHECK_CUDA(cudaMemcpy(&global_norm_sq, device_contexts[0].d_scalar_host_ptr, sizeof(double), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&global_norm_sq, device_contexts[0].d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
 
         double global_norm = std::sqrt(global_norm_sq);
         
@@ -1070,9 +1058,9 @@ struct ArnoldiRunner {
             for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
                 CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
                 DeviceContext& dc = device_contexts[gpu_id];
-                CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_host_ptr, &local_dots[gpu_id], sizeof(double), 
+                CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_device, &local_dots[gpu_id], sizeof(double), 
                                            cudaMemcpyHostToDevice, dc.stream_reduce));
-                nccl_context.allreduce_sum(dc.d_scalar_host_ptr, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
+                nccl_context.allreduce_sum(dc.d_scalar_device, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
             }
             CHECK_NCCL(ncclGroupEnd());
             
@@ -1080,7 +1068,7 @@ struct ArnoldiRunner {
             double h_ij = 0.0;
             CHECK_CUDA(cudaSetDevice(device_contexts[0].device_id));
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[0].stream_reduce));
-            CHECK_CUDA(cudaMemcpy(&h_ij, device_contexts[0].d_scalar_host_ptr, sizeof(double), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(&h_ij, device_contexts[0].d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
 
             // Phase 3: Update w = w - h_{i,j} * q_i on each GPU
             const double alpha = -h_ij;
@@ -1130,16 +1118,16 @@ struct ArnoldiRunner {
                 for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
                     CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
                     DeviceContext& dc = device_contexts[gpu_id];
-                    CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_host_ptr, &local_dots[gpu_id], sizeof(double), 
+                    CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_device, &local_dots[gpu_id], sizeof(double), 
                                                cudaMemcpyHostToDevice, dc.stream_reduce));
-                    nccl_context.allreduce_sum(dc.d_scalar_host_ptr, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
+                    nccl_context.allreduce_sum(dc.d_scalar_device, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
                 }
                 CHECK_NCCL(ncclGroupEnd());
                 
                 double h_ij_correction = 0.0;
                 CHECK_CUDA(cudaSetDevice(device_contexts[0].device_id));
                 CHECK_CUDA(cudaStreamSynchronize(device_contexts[0].stream_reduce));
-                CHECK_CUDA(cudaMemcpy(&h_ij_correction, device_contexts[0].d_scalar_host_ptr, sizeof(double), cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(&h_ij_correction, device_contexts[0].d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
 
                 const double alpha = -h_ij_correction;
                 for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
@@ -1177,16 +1165,16 @@ struct ArnoldiRunner {
         for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
             CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
             DeviceContext& dc = device_contexts[gpu_id];
-            CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_host_ptr, &local_norms_squared[gpu_id], sizeof(double), 
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_device, &local_norms_squared[gpu_id], sizeof(double), 
                                        cudaMemcpyHostToDevice, dc.stream_reduce));
-            nccl_context.allreduce_sumsq(dc.d_scalar_host_ptr, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
+            nccl_context.allreduce_sumsq(dc.d_scalar_device, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
         }
         CHECK_NCCL(ncclGroupEnd());
         
         double global_norm_squared = 0.0;
         CHECK_CUDA(cudaSetDevice(device_contexts[0].device_id));
         CHECK_CUDA(cudaStreamSynchronize(device_contexts[0].stream_reduce));
-        CHECK_CUDA(cudaMemcpy(&global_norm_squared, device_contexts[0].d_scalar_host_ptr, sizeof(double), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&global_norm_squared, device_contexts[0].d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
 
         double global_norm = std::sqrt(global_norm_squared);
         
@@ -1286,35 +1274,73 @@ struct ArnoldiRunner {
         }
     }
 
-    bool residual_estimate() {
-        
+    double residual_estimate() {
         // Residual-based convergence check: ||r_m|| ≈ |h_{m+1,m}| * ||e_m^T * exp(t*H_m) * e1||
-        // where e_m is the m-th canonical basis vector
-        
-        // Use the m x m block of H_m for exponential
         Eigen::MatrixXd H_m_square = H_m.block(0, 0, params.m, params.m);
         Eigen::MatrixXd exp_tH_square = matrix_exp_stable(params.t * H_m_square);
-        
-        // e1_small is the first canonical basis vector for the m x m system
+
         Eigen::VectorXd e1_small = Eigen::VectorXd::Zero(params.m);
         e1_small(0) = 1.0;
-        
-        // Compute exp(t*H_m_square) * e1_small
+
         Eigen::VectorXd exp_tH_e1 = exp_tH_square * e1_small;
-        
-        // e_m is the last canonical basis vector
         double e_m_exp_tH_e1 = exp_tH_e1(params.m - 1);
-        
-        // Get h_{m+1,m} from H_m
+
         double h_m_plus_1_m = H_m(params.m, params.m - 1);
-        
-        // Estimate residual norm
         double residual_norm = std::abs(h_m_plus_1_m * e_m_exp_tH_e1);
-        
-        // Check convergence
-        bool converged = (residual_norm <= params.tol);
-        
-        return converged;
+
+        return residual_norm;
+    }
+
+    // Use the current y as the next starting vector (restart) and rebuild q1/V_m[0]
+    void restart_from_y() {
+        std::vector<double> local_norms_squared(num_gpus);
+
+        // 1) Local norms of y on each GPU
+        for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
+            DeviceContext& dc = device_contexts[gpu_id];
+
+            double local_norm = 0.0;
+            CHECK_CUBLAS(cublasDnrm2(dc.cublas_handle, dc.local_rows, dc.d_y, 1, &local_norm));
+            local_norms_squared[gpu_id] = local_norm * local_norm;
+        }
+
+        // 2) AllReduce to obtain global norm of y
+        CHECK_NCCL(ncclGroupStart());
+        for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
+            DeviceContext& dc = device_contexts[gpu_id];
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_scalar_device, &local_norms_squared[gpu_id], sizeof(double),
+                                       cudaMemcpyHostToDevice, dc.stream_reduce));
+            nccl_context.allreduce_sumsq(dc.d_scalar_device, 1, nccl_context.comms[gpu_id], dc.stream_reduce);
+        }
+        CHECK_NCCL(ncclGroupEnd());
+
+        double global_norm_sq = 0.0;
+        CHECK_CUDA(cudaSetDevice(device_contexts[0].device_id));
+        CHECK_CUDA(cudaStreamSynchronize(device_contexts[0].stream_reduce));
+        CHECK_CUDA(cudaMemcpy(&global_norm_sq, device_contexts[0].d_scalar_device, sizeof(double), cudaMemcpyDeviceToHost));
+
+        v_norm = std::sqrt(global_norm_sq);
+        const double alpha = 1.0 / v_norm;
+
+        // 3) Normalize y to obtain new q1 and store in V_m[:,0]
+        for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
+            DeviceContext& dc = device_contexts[gpu_id];
+
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_q, dc.d_y, sizeof(double) * dc.local_rows,
+                                       cudaMemcpyDeviceToDevice, dc.stream_compute));
+            CHECK_CUBLAS(cublasDscal(dc.cublas_handle, dc.local_rows, &alpha, dc.d_q, 1));
+            CHECK_CUDA(cudaMemcpyAsync(dc.d_V_m, dc.d_q, sizeof(double) * dc.local_rows,
+                                       cudaMemcpyDeviceToDevice, dc.stream_compute));
+        }
+
+        // 4) Ensure q1 is ready on all GPUs
+        for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[gpu_id].device_id));
+            CHECK_CUDA(cudaStreamSynchronize(device_contexts[gpu_id].stream_compute));
+        }
     }
 
     void destroy() {
@@ -1329,24 +1355,59 @@ int main(int argc, char* argv[]) {
     std::cout << "Starting matrix_exp application." << std::endl;
 
     // Parse command-line arguments:
-    //  - If the first argument looks like a file path (contains '.' or '/' or ends with .mtx),
-    //    load a Matrix Market file.
-    //  - Otherwise, treat it as the size of a generated test matrix.
+    // Positional style: ./matrix_exp [matrix_or_size] [m] [max_restarts]
+    // Named style:      --m N, --max-restarts N
     bool use_file = false;
     std::string matrix_file;
     int test_size = 1000; // Default size for generated matrix
+    int m_param = -1;     // If -1, will be derived from matrix size
+    int max_restarts_cli = MAX_RESTARTS; // If <=0, run until convergence
+    double t_cli = 1.0;   // Time parameter (default 1.0)
 
-    if (argc > 1) {
-        std::string arg1 = argv[1];
-        if (arg1.find(".") != std::string::npos || arg1.find("/") != std::string::npos || arg1.rfind(".mtx") != std::string::npos) {
-            use_file = true;
-            matrix_file = arg1;
-        } else {
-            test_size = std::atoi(argv[1]);
-            if (test_size <= 0) {
-                std::cerr << "Error: Matrix size must be a positive integer. Using default size 1000." << std::endl;
-                test_size = 1000;
+    std::vector<std::string> args(argv + 1, argv + argc);
+    size_t pos_idx = 0;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--m" && i + 1 < args.size()) {
+            m_param = std::atoi(args[i + 1].c_str());
+            ++i;
+            continue;
+        }
+        if (a == "--max-restarts" && i + 1 < args.size()) {
+            max_restarts_cli = std::atoi(args[i + 1].c_str());
+            ++i;
+            continue;
+        }
+        if (a == "--t" && i + 1 < args.size()) {
+            t_cli = std::atof(args[i + 1].c_str());
+            ++i;
+            continue;
+        }
+
+        // Positional handling
+        if (pos_idx == 0) {
+            if (a.find(".") != std::string::npos || a.find("/") != std::string::npos || a.rfind(".mtx") != std::string::npos) {
+                use_file = true;
+                matrix_file = a;
+            } else {
+                test_size = std::atoi(a.c_str());
+                if (test_size <= 0) {
+                    std::cerr << "Error: Matrix size must be a positive integer. Using default size 1000." << std::endl;
+                    test_size = 1000;
+                }
             }
+            ++pos_idx;
+            continue;
+        }
+        if (pos_idx == 1) {
+            m_param = std::atoi(a.c_str());
+            ++pos_idx;
+            continue;
+        }
+        if (pos_idx == 2) {
+            max_restarts_cli = std::atoi(a.c_str());
+            ++pos_idx;
+            continue;
         }
     }
 
@@ -1398,6 +1459,23 @@ int main(int argc, char* argv[]) {
                       << " with " << test_matrix.nnz << " non-zeros" << std::endl;
         }
 
+        // Quick sanity: clamp time step if matrix has huge entries to avoid exp overflow
+        double max_abs_A = 0.0;
+        for (double v : test_matrix.values) {
+            max_abs_A = std::max(max_abs_A, std::abs(v));
+        }
+        if (max_abs_A <= 0.0) {
+            max_abs_A = 1.0; // avoid division by zero if matrix is all zeros
+        }
+        double t_safe = t_cli;
+        // Keep t*||A||_max below ~10 to avoid exp overflow on very large entries
+        double t_limit = 10.0 / max_abs_A;
+        if (t_safe > t_limit) {
+            std::cout << "[WARN] Requested t=" << t_safe << " is large for max|A|=" << max_abs_A
+                      << ". Clamping t to " << t_limit << " to avoid overflow." << std::endl;
+            t_safe = t_limit;
+        }
+
         // Partition matrix across GPUs
         auto partitions = test_matrix.partition_rows(num_gpus_to_use);
         std::cout << "Partitioned matrix across " << num_gpus_to_use << " GPUs" << std::endl;
@@ -1409,9 +1487,22 @@ int main(int argc, char* argv[]) {
         }
 
         // Set up Arnoldi parameters
-        // Clamp m so it does not exceed (rows - 1) to avoid zero/invalid norm on tiny matrices
-        int m_param = std::min(30, std::max(5, test_matrix.rows - 1));
-        ArnoldiParams params(m_param, 1.0, 1e-6, 3, true); // m=tunable, t=1.0, tol=1e-6, max_restarts=3
+        int m_val = m_param;
+        if (m_val <= 0) {
+            m_val = std::min(30, std::max(5, test_matrix.rows - 1));
+        }
+        // Clamp to matrix size
+        m_val = std::max(1, std::min(m_val, test_matrix.rows - 1));
+
+        int max_restarts_val = max_restarts_cli;
+        // max_restarts_val <= 0 means run until convergence
+        ArnoldiParams params(m_val, t_safe, 1e-6, max_restarts_val, true);
+
+        std::cout << "Arnoldi params: m=" << params.m
+                  << " t=" << params.t
+                  << " tol=" << params.tol
+                  << " max_restarts=" << params.max_restarts
+                  << std::endl;
 
         // Create ArnoldiRunner
         ArnoldiRunner runner(num_gpus_to_use, params, test_matrix.rows, test_matrix.cols);
@@ -1431,6 +1522,13 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < std::min(10, (int)y_host.size()); ++i) {
             std::cout << "y[" << i << "] = " << y_host[i] << std::endl;
         }
+        std::cout << "Arnoldi summary: "
+                  << "m=" << m_val
+                  << ", max_restarts=" << max_restarts_val
+                  << ", restarts_done=" << runner.restarts_done
+                  << ", converged=" << (runner.converged ? "yes" : "no")
+                  << ", residual=" << runner.last_residual
+                  << std::endl;
 
         // Clean up
         runner.destroy();

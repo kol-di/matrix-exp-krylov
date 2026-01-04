@@ -20,6 +20,9 @@ SIZE=1000
 MATRIX_FILE=""
 LOG_DIR=${LOG_DIR:-"logs"}
 PROFILE_DIR=${PROFILE_DIR:-"$LOG_DIR/profiles"}
+M_PARAM=""
+T_PARAM=""
+MAX_RESTARTS_PARAM=""
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 # Resolve paths relative to project root (so they don't end up under build/)
 if [[ "$LOG_DIR" = /* ]]; then
@@ -54,11 +57,23 @@ if [[ $# -gt 0 && "$1" == --* ]]; then
                 MATRIX_FILE="$2"
                 shift 2
                 ;;
+            --m)
+                M_PARAM="$2"
+                shift 2
+                ;;
+            --t)
+                T_PARAM="$2"
+                shift 2
+                ;;
+            --max-restarts)
+                MAX_RESTARTS_PARAM="$2"
+                shift 2
+                ;;
             *)
                 echo "Unknown option: $1"
                 echo "Usage: ./launch.sh [gpus] [time] [size|matrix_file]"
-                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME]"
-                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME]"
+                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K]"
+                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K]"
                 exit 1
                 ;;
         esac
@@ -74,6 +89,13 @@ else
         else
             SIZE="$THIRD"
         fi
+    fi
+    # Optional 4th and 5th positional for m and max_restarts (matching main)
+    if [[ -n "${4-}" ]]; then
+        M_PARAM="$4"
+    fi
+    if [[ -n "${5-}" ]]; then
+        MAX_RESTARTS_PARAM="$5"
     fi
 fi
 
@@ -98,6 +120,15 @@ else
 fi
 echo "  Logs dir: $LOG_DIR_RES"
 echo "  Profiles dir: $PROFILE_DIR_RES"
+if [[ -n "$M_PARAM" ]]; then
+    echo "  Arnoldi m: $M_PARAM"
+fi
+if [[ -n "$T_PARAM" ]]; then
+    echo "  Time parameter t: $T_PARAM"
+fi
+if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
+    echo "  Max restarts: $MAX_RESTARTS_PARAM (<=0 means until convergence)"
+fi
 echo ""
 
 # Ensure log/profile directories exist (submission side)
@@ -201,7 +232,21 @@ fi
 cd build
 PROFILE_OUTPUT="${PROFILE_DIR_RES}/matrix_exp_profile_\${SLURM_JOB_ID}"
 echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
+echo "Executable command: ./matrix_exp \"\$ACTUAL_ARG\" \$EXTRA_ARGS"
 echo ""
+echo ""
+
+# Build extra args for Arnoldi params
+EXTRA_ARGS=""
+if [[ -n "$M_PARAM" ]]; then
+    EXTRA_ARGS+=" --m $M_PARAM"
+fi
+if [[ -n "$T_PARAM" ]]; then
+    EXTRA_ARGS+=" --t $T_PARAM"
+fi
+if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
+    EXTRA_ARGS+=" --max-restarts $MAX_RESTARTS_PARAM"
+fi
 
 nsys profile \\
     --output="\$PROFILE_OUTPUT" \\
@@ -209,7 +254,7 @@ nsys profile \\
     --trace=cuda,nvtx,osrt \\
     --stats=true \\
     --cuda-memory-usage=true \\
-    ./matrix_exp "\$ACTUAL_ARG"
+    ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
 
 PROFILE_EXIT_CODE=\$?
 
@@ -237,6 +282,7 @@ echo "Job submitted with ID: $JOB_ID"
 echo ""
 
 # Clean up temporary file
+cp "$TEMP_SLURM" "$PROJECT_ROOT/last_sbatch.sh"
 rm "$TEMP_SLURM"
 
 # Show job status
