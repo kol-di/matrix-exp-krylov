@@ -1328,18 +1328,28 @@ struct ArnoldiRunner {
 int main(int argc, char* argv[]) {
     std::cout << "Starting matrix_exp application." << std::endl;
 
-    // Parse command-line arguments
-    int test_size = 1000; // Default size
+    // Parse command-line arguments:
+    //  - If the first argument looks like a file path (contains '.' or '/' or ends with .mtx),
+    //    load a Matrix Market file.
+    //  - Otherwise, treat it as the size of a generated test matrix.
+    bool use_file = false;
+    std::string matrix_file;
+    int test_size = 1000; // Default size for generated matrix
+
     if (argc > 1) {
-        test_size = std::atoi(argv[1]);
-        if (test_size <= 0) {
-            std::cerr << "Error: Matrix size must be a positive integer. Using default size 1000." << std::endl;
-            test_size = 1000;
+        std::string arg1 = argv[1];
+        if (arg1.find(".") != std::string::npos || arg1.find("/") != std::string::npos || arg1.rfind(".mtx") != std::string::npos) {
+            use_file = true;
+            matrix_file = arg1;
+        } else {
+            test_size = std::atoi(argv[1]);
+            if (test_size <= 0) {
+                std::cerr << "Error: Matrix size must be a positive integer. Using default size 1000." << std::endl;
+                test_size = 1000;
+            }
         }
     }
-    std::cout << "Matrix size: " << test_size << std::endl;
 
-    // Example usage
     try {
         // Check available GPUs
         int num_gpus;
@@ -1358,28 +1368,35 @@ int main(int argc, char* argv[]) {
             device_ids[i] = i;
         }
 
-        // Create a simple test matrix (diagonal matrix for testing)
+        // Prepare matrix
         CSRHost test_matrix;
-        test_matrix.rows = test_size;
-        test_matrix.cols = test_size;
-        test_matrix.nnz = test_size;
-        
-        // Create diagonal matrix
-        test_matrix.row_ptr.resize(test_matrix.rows + 1);
-        test_matrix.col_idx.resize(test_matrix.nnz);
-        test_matrix.values.resize(test_matrix.nnz);
-        
-        for (int i = 0; i < test_matrix.rows; ++i) {
-            test_matrix.row_ptr[i] = i;
-            test_matrix.col_idx[i] = i;
-            // Use different diagonal values to avoid degenerate case
-            // Values range from 1.0 to 2.0
-            test_matrix.values[i] = 1.0 + (double)i / test_matrix.rows;
-        }
-        test_matrix.row_ptr[test_matrix.rows] = test_matrix.nnz;
+        if (use_file) {
+            std::cout << "Loading matrix from file: " << matrix_file << std::endl;
+            test_matrix.from_matrix_market(matrix_file);
+            std::cout << "Loaded matrix: " << test_matrix.rows << "x" << test_matrix.cols
+                      << " with " << test_matrix.nnz << " non-zeros" << std::endl;
+        } else {
+            std::cout << "Matrix size (generated): " << test_size << std::endl;
+            // Create a simple test matrix (diagonal matrix for testing)
+            test_matrix.rows = test_size;
+            test_matrix.cols = test_size;
+            test_matrix.nnz = test_size;
+            
+            test_matrix.row_ptr.resize(test_matrix.rows + 1);
+            test_matrix.col_idx.resize(test_matrix.nnz);
+            test_matrix.values.resize(test_matrix.nnz);
+            
+            for (int i = 0; i < test_matrix.rows; ++i) {
+                test_matrix.row_ptr[i] = i;
+                test_matrix.col_idx[i] = i;
+                // Use different diagonal values to avoid degenerate case
+                test_matrix.values[i] = 1.0 + (double)i / test_matrix.rows;
+            }
+            test_matrix.row_ptr[test_matrix.rows] = test_matrix.nnz;
 
-        std::cout << "Created test matrix: " << test_matrix.rows << "x" << test_matrix.cols 
-                  << " with " << test_matrix.nnz << " non-zeros" << std::endl;
+            std::cout << "Created test matrix: " << test_matrix.rows << "x" << test_matrix.cols 
+                      << " with " << test_matrix.nnz << " non-zeros" << std::endl;
+        }
 
         // Partition matrix across GPUs
         auto partitions = test_matrix.partition_rows(num_gpus_to_use);
@@ -1392,8 +1409,9 @@ int main(int argc, char* argv[]) {
         }
 
         // Set up Arnoldi parameters
-        // Using m=30 for good balance between accuracy and speed
-        ArnoldiParams params(30, 1.0, 1e-6, 3, true); // m=30, t=1.0, tol=1e-6, max_restarts=3
+        // Clamp m so it does not exceed (rows - 1) to avoid zero/invalid norm on tiny matrices
+        int m_param = std::min(30, std::max(5, test_matrix.rows - 1));
+        ArnoldiParams params(m_param, 1.0, 1e-6, 3, true); // m=tunable, t=1.0, tol=1e-6, max_restarts=3
 
         // Create ArnoldiRunner
         ArnoldiRunner runner(num_gpus_to_use, params, test_matrix.rows, test_matrix.cols);

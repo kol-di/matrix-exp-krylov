@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # Simple Matrix Exponential Launcher Script
-# Usage: ./launch.sh [gpus] [time] [size]
+# Usage: ./launch.sh [gpus] [time] [size|matrix_file]
 #   or:  ./launch.sh --size SIZE [--gpus GPUS] [--time TIME]
+#   or:  ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME]
 #
 # Examples:
 #   ./launch.sh                    # defaults: 2 GPU, 5 min, size 1000
-#   ./launch.sh 4 00:10:00 2000    # 4 GPU, 10 min, size 2000
+#   ./launch.sh 4 00:10:00 2000    # 4 GPU, 10 min, size 2000 (positional)
+#   ./launch.sh matrices/A.mtx     # load matrix file (defaults for gpus/time)
+#   ./launch.sh --matrix matrices/A.mtx --gpus 4 --time 00:15:00
 #   ./launch.sh --size 500         # size 500, other params default
 #   ./launch.sh --size 2000 --gpus 4 --time 00:15:00
 
@@ -14,10 +17,11 @@
 GPUS=2
 TIME="00:05:00"
 SIZE=1000
+MATRIX_FILE=""
 
 # Parse arguments
 # If first argument starts with '--', use named arguments
-if [[ "$1" == --* ]]; then
+if [[ $# -gt 0 && "$1" == --* ]]; then
     while [[ $# -gt 0 ]]; do
         case $1 in
             --gpus)
@@ -32,10 +36,15 @@ if [[ "$1" == --* ]]; then
                 SIZE="$2"
                 shift 2
                 ;;
+            --matrix)
+                MATRIX_FILE="$2"
+                shift 2
+                ;;
             *)
                 echo "Unknown option: $1"
-                echo "Usage: ./launch.sh [gpus] [time] [size]"
+                echo "Usage: ./launch.sh [gpus] [time] [size|matrix_file]"
                 echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME]"
+                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME]"
                 exit 1
                 ;;
         esac
@@ -44,21 +53,42 @@ else
     # Positional arguments (old style)
     GPUS=${1:-2}
     TIME=${2:-"00:05:00"}
-    SIZE=${3:-1000}
+    THIRD=${3:-""}
+    if [[ -n "$THIRD" ]]; then
+        if [[ "$THIRD" == *.* || "$THIRD" == */* || "$THIRD" == *.mtx ]]; then
+            MATRIX_FILE="$THIRD"
+        else
+            SIZE="$THIRD"
+        fi
+    fi
+fi
+
+# Decide what to pass to the executable
+RUN_ARG="$SIZE"
+JOB_TAG="size${SIZE}"
+if [[ -n "$MATRIX_FILE" ]]; then
+    RUN_ARG="$MATRIX_FILE"
+    JOB_TAG=$(basename "$MATRIX_FILE")
+    # sanitize job tag (remove slashes/spaces)
+    JOB_TAG=${JOB_TAG//[^A-Za-z0-9._-]/_}
 fi
 
 echo "=== Simple Matrix Exponential Job Launcher ==="
 echo "Configuration:"
 echo "  GPUs: $GPUS"
 echo "  Time limit: $TIME"
-echo "  Matrix size: $SIZE"
+if [[ -n "$MATRIX_FILE" ]]; then
+    echo "  Matrix file: $MATRIX_FILE"
+else
+    echo "  Matrix size: $SIZE"
+fi
 echo ""
 
 # Create temporary SLURM script
 TEMP_SLURM=$(mktemp)
 cat > "$TEMP_SLURM" << EOF
 #!/bin/bash
-#SBATCH --job-name=matrix_exp_${SIZE}_${GPUS}gpu
+#SBATCH --job-name=matrix_exp_${JOB_TAG}_${GPUS}gpu
 #SBATCH --account=proj_1720
 #SBATCH --partition=normal
 #SBATCH --nodes=1
@@ -110,7 +140,11 @@ if [ ! -f "./build/matrix_exp" ]; then
 fi
 
 echo "Running matrix exponential computation with Nsight Systems profiling..."
+if [[ -n "$MATRIX_FILE" ]]; then
+echo "Matrix file: $MATRIX_FILE"
+else
 echo "Matrix size: $SIZE"
+fi
 echo ""
 
 # Check if nsys is available
@@ -122,6 +156,26 @@ fi
 echo "Nsight Systems version:"
 nsys --version
 echo ""
+
+# Prepare matrix file if provided
+ACTUAL_ARG="$RUN_ARG"
+TEMP_MATRIX=""
+if [[ -n "$MATRIX_FILE" ]]; then
+    if [[ ! -f "$MATRIX_FILE" ]]; then
+        echo "ERROR: Matrix file not found: $MATRIX_FILE"
+        exit 1
+    fi
+    if [[ "$MATRIX_FILE" == *.gz ]]; then
+        TEMP_MATRIX="/tmp/matrix_\${SLURM_JOB_ID}.mtx"
+        echo "Decompressing matrix to \$TEMP_MATRIX ..."
+        gzip -dc "$MATRIX_FILE" > "\$TEMP_MATRIX"
+        if [[ \$? -ne 0 ]]; then
+            echo "ERROR: Failed to decompress $MATRIX_FILE"
+            exit 1
+        fi
+        ACTUAL_ARG="\$TEMP_MATRIX"
+    fi
+fi
 
 # Run the program with nsys profiling
 cd build
@@ -135,7 +189,7 @@ nsys profile \\
     --trace=cuda,nvtx,osrt \\
     --stats=true \\
     --cuda-memory-usage=true \\
-    ./matrix_exp $SIZE
+    ./matrix_exp "\$ACTUAL_ARG"
 
 PROFILE_EXIT_CODE=\$?
 
