@@ -1,12 +1,51 @@
 #!/bin/bash
 
 # Simple Matrix Exponential Launcher Script
-# Usage: ./launch_simple.sh [gpus] [time] [size]
+# Usage: ./launch.sh [gpus] [time] [size]
+#   or:  ./launch.sh --size SIZE [--gpus GPUS] [--time TIME]
+#
+# Examples:
+#   ./launch.sh                    # defaults: 2 GPU, 5 min, size 1000
+#   ./launch.sh 4 00:10:00 2000    # 4 GPU, 10 min, size 2000
+#   ./launch.sh --size 500         # size 500, other params default
+#   ./launch.sh --size 2000 --gpus 4 --time 00:15:00
 
 # Default values
-GPUS=${1:-2}
-TIME=${2:-"00:05:00"}
-SIZE=${3:-1000}
+GPUS=2
+TIME="00:05:00"
+SIZE=1000
+
+# Parse arguments
+# If first argument starts with '--', use named arguments
+if [[ "$1" == --* ]]; then
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --gpus)
+                GPUS="$2"
+                shift 2
+                ;;
+            --time)
+                TIME="$2"
+                shift 2
+                ;;
+            --size)
+                SIZE="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Usage: ./launch.sh [gpus] [time] [size]"
+                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME]"
+                exit 1
+                ;;
+        esac
+    done
+else
+    # Positional arguments (old style)
+    GPUS=${1:-2}
+    TIME=${2:-"00:05:00"}
+    SIZE=${3:-1000}
+fi
 
 echo "=== Simple Matrix Exponential Job Launcher ==="
 echo "Configuration:"
