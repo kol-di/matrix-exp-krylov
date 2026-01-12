@@ -14,6 +14,7 @@
 #include <cusparse.h>
 #include <cublas_v2.h>
 #include <nccl.h>
+#include <nvToolsExt.h>
 
 // Eigen for small matrix exponentiation (using only stable modules)
 #include <Eigen/Dense>
@@ -25,6 +26,11 @@ Eigen::MatrixXd matrix_exp_stable(const Eigen::MatrixXd& A) {
     // Use Eigen's matrix exponential (scaling-squaring + Pade), more stable for non-normal matrices
     return A.exp();
 }
+
+struct NvtxRange {
+    explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+    ~NvtxRange() { nvtxRangePop(); }
+};
 
 // Error checking macro
 #define CHECK_CUDA(func) \
@@ -622,6 +628,7 @@ struct ArnoldiRunner {
     }
 
     void compute_expmv(const std::vector<double>& v_host, std::vector<double>& y_host) {
+        NvtxRange total_range("total_compute_expmv");
         // Full procedure: normalize q1 -> Arnoldi restarts -> small exponentiation -> lift -> restart/finish
         // This will be the main orchestration method.
         // Details will be filled in subsequent steps.
@@ -632,6 +639,7 @@ struct ArnoldiRunner {
         restarts_done = 0;
         converged = false;
         while (true) {
+            NvtxRange restart_range("arnoldi_iter");
             // Reset H_m for new Arnoldi run
             H_m.setZero(params.m + 1, params.m);
 
@@ -656,13 +664,16 @@ struct ArnoldiRunner {
             small_expm_and_lift();
 
             // F) Evaluate residual and decide on restart
-            last_residual = residual_estimate();
-            if (last_residual <= params.tol) {
-                converged = true;
-                break; // Converged
-            } else {
-                // If not converged, d_y (computed in small_expm_and_lift) becomes the new v for restart
-                restart_from_y();
+            {
+                NvtxRange check_range("restart_check");
+                last_residual = residual_estimate();
+                if (last_residual <= params.tol) {
+                    converged = true;
+                    break; // Converged
+                } else {
+                    // If not converged, d_y (computed in small_expm_and_lift) becomes the new v for restart
+                    restart_from_y();
+                }
             }
 
             ++restarts_done;
@@ -693,6 +704,7 @@ struct ArnoldiRunner {
 
     // Internal methods (details to be implemented)
     void init_q1(const std::vector<double>& v_host) {
+        NvtxRange r_init("init_q1");
         std::vector<double> local_v_norms_squared(num_gpus);
 
         for (int i = 0; i < num_gpus; ++i) {
@@ -1229,6 +1241,7 @@ struct ArnoldiRunner {
     }
 
     void small_expm_and_lift() {
+        NvtxRange r_small("small_expm_and_lift");
 
         // Phase 1: Compute small matrix exponential on CPU using Eigen
         // Create e1 vector (first canonical basis vector)

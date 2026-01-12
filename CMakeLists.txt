@@ -41,6 +41,7 @@ target_link_libraries(matrix_exp
   CUDA::cudart
   CUDA::cublas
   CUDA::cusparse
+  CUDA::nvToolsExt
   nccl
   Eigen3::Eigen
 )
