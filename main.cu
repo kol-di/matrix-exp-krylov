@@ -219,6 +219,12 @@ struct CSRHost {
     GhostMap build_owner_ghost_maps(const std::vector<CSRHost>& partitions, int my_gpu_id, int num_gpus) const {
         GhostMap ghost_map;
 
+        // Pre-size offset/count vectors to avoid out-of-bounds writes
+        ghost_map.send_offsets.assign(num_gpus, 0);
+        ghost_map.send_counts.assign(num_gpus, 0);
+        ghost_map.recv_offsets.assign(num_gpus, 0);
+        ghost_map.recv_counts.assign(num_gpus, 0);
+
         // Determine global row ranges for each GPU
         std::vector<std::pair<int, int>> gpu_row_ranges(num_gpus);
         int current_global_row = 0;
@@ -229,7 +235,6 @@ struct CSRHost {
 
         // ============================ Building RECEIVE maps for my_gpu_id ===============================
         // Identify ghost columns for current GPU (elements it needs to receive)
-        std::set<int> unique_incoming_ghost_cols;
         const CSRHost& my_partition = partitions[my_gpu_id];
         
         for (int k = 0; k < my_partition.nnz; ++k) {
@@ -237,42 +242,41 @@ struct CSRHost {
             // Check if the column owner is not this GPU
             bool is_local_col = (col >= gpu_row_ranges[my_gpu_id].first && col <= gpu_row_ranges[my_gpu_id].second);
             if (!is_local_col) {
-                unique_incoming_ghost_cols.insert(col);
-            }
-        }
-
-        for (int col : unique_incoming_ghost_cols) {
-            ghost_map.incoming_global_col_indices.push_back(col);
-            // Determine owner of this ghost column
-            for (int i = 0; i < num_gpus; ++i) {
-                if (col >= gpu_row_ranges[i].first && col <= gpu_row_ranges[i].second) {
-                    ghost_map.owner_to_consumer_map[i].push_back(col); // This GPU (my_gpu_id) needs 'col' from GPU 'i'
-                    break;
+                // Determine owner of this ghost column
+                for (int i = 0; i < num_gpus; ++i) {
+                    if (col >= gpu_row_ranges[i].first && col <= gpu_row_ranges[i].second) {
+                        ghost_map.owner_to_consumer_map[i].push_back(col); // This GPU (my_gpu_id) needs 'col' from GPU 'i'
+                        break;
+                    }
                 }
             }
         }
-        
-        // Sort incoming ghost indices to ensure deterministic order
-        std::sort(ghost_map.incoming_global_col_indices.begin(), ghost_map.incoming_global_col_indices.end());
 
-        // Populate incoming_peer_info and recv_offsets/counts
+        // Sort/unique per-owner lists and flatten in owner order to make offsets consistent
         size_t current_recv_offset = 0;
         for (int p_id = 0; p_id < num_gpus; ++p_id) {
             if (p_id == my_gpu_id) continue;
-            // Sort indices for each owner_to_consumer list for potential contiguous blocks (even if unlikely)
-            std::sort(ghost_map.owner_to_consumer_map[p_id].begin(), ghost_map.owner_to_consumer_map[p_id].end());
-            size_t count = ghost_map.owner_to_consumer_map[p_id].size();
+            auto& lst = ghost_map.owner_to_consumer_map[p_id];
+            std::sort(lst.begin(), lst.end());
+            lst.erase(std::unique(lst.begin(), lst.end()), lst.end());
+
+            size_t count = lst.size();
             if (count > 0) {
                 ghost_map.incoming_peer_info[p_id] = {current_recv_offset, count};
                 ghost_map.recv_offsets[p_id] = current_recv_offset;
                 ghost_map.recv_counts[p_id] = count;
+
+                // Append to the flattened incoming list in the same order
+                ghost_map.incoming_global_col_indices.insert(
+                    ghost_map.incoming_global_col_indices.end(),
+                    lst.begin(), lst.end());
+
                 current_recv_offset += count;
             }
         }
         ghost_map.total_recv_size = current_recv_offset;
 
         // ============================ Building SEND maps for my_gpu_id ==================================
-        std::set<int> unique_outgoing_global_cols;
         // Iterate through all OTHER partitions and see what they need from MY_GPU_ID
         for (int p_id = 0; p_id < num_gpus; ++p_id) {
             if (p_id == my_gpu_id) continue;
@@ -284,7 +288,6 @@ struct CSRHost {
                 if (col >= gpu_row_ranges[my_gpu_id].first && col <= gpu_row_ranges[my_gpu_id].second) {
                     bool is_local_to_other = (col >= gpu_row_ranges[p_id].first && col <= gpu_row_ranges[p_id].second);
                     if (!is_local_to_other) {
-                        unique_outgoing_global_cols.insert(col);
                         ghost_map.consumer_to_owner_map[p_id].push_back(col); // This GPU (my_gpu_id) needs to send 'col' to GPU 'p_id'
                     }
                 }
@@ -296,22 +299,21 @@ struct CSRHost {
                 ghost_map.consumer_to_owner_map[p_id].end()
             );
         }
-
-        for (int col : unique_outgoing_global_cols) {
-            ghost_map.outgoing_global_col_indices.push_back(col);
-        }
-        // Sort outgoing global column indices for deterministic kernel processing
-        std::sort(ghost_map.outgoing_global_col_indices.begin(), ghost_map.outgoing_global_col_indices.end());
-
-        // Populate outgoing_peer_info and send_offsets/counts
+        // Flatten outgoing lists in consumer order to match offsets
         size_t current_send_offset = 0;
         for (int p_id = 0; p_id < num_gpus; ++p_id) {
             if (p_id == my_gpu_id) continue;
-            size_t count = ghost_map.consumer_to_owner_map[p_id].size();
+            auto& lst = ghost_map.consumer_to_owner_map[p_id];
+            size_t count = lst.size();
             if (count > 0) {
                 ghost_map.outgoing_peer_info[p_id] = {current_send_offset, count};
                 ghost_map.send_offsets[p_id] = current_send_offset;
                 ghost_map.send_counts[p_id] = count;
+
+                ghost_map.outgoing_global_col_indices.insert(
+                    ghost_map.outgoing_global_col_indices.end(),
+                    lst.begin(), lst.end());
+
                 current_send_offset += count;
             }
         }
@@ -562,6 +564,7 @@ struct ArnoldiRunner {
     bool converged = false;
     int restarts_done = 0;
     double last_residual = 0.0;
+    double current_segment_t = 0.0; // effective t used in current Arnoldi pass
     std::vector<CSRHost::GhostMap> ghost_maps;
 
     // Host-side data for small H_m matrix and wH vector
@@ -635,53 +638,68 @@ struct ArnoldiRunner {
         // 1. Initialize q1 (norm of v and scale v)
         init_q1(v_host);
 
-        // 2. Arnoldi iterations (main loop with restarts)
+        // 2. Arnoldi iterations (main loop with restarts / time-splitting)
         restarts_done = 0;
         converged = false;
-        while (true) {
+
+        // Split total time into segments to avoid repeated application of exp(tA)
+        double total_t = params.t;
+        int total_steps = (params.max_restarts > 0) ? (params.max_restarts + 1) : 1;
+        double base_segment_t = total_t / static_cast<double>(total_steps);
+        double t_done = 0.0;
+        int step = 0;
+        while (step < total_steps && t_done < total_t) {
             NvtxRange restart_range("arnoldi_iter");
+            // Use base segment length, last step absorbs any remainder to hit total_t exactly.
+            current_segment_t = (step == total_steps - 1) ? (total_t - t_done) : std::min(base_segment_t, total_t - t_done);
+
             // Reset H_m for new Arnoldi run
             H_m.setZero(params.m + 1, params.m);
+            int k_used = 0; // actual Krylov dimension used this segment
 
             // Arnoldi loop for j = 1 to m
             for (int j = 0; j < params.m; ++j) {
                 // A) Prepare q_j (ghost exchange and on-diag SpMV)
-                ghost_exchange_qj(j); // Exchange ghost data for current q_j
                 spmv_on_off(j);       // Compute A*q_j and store in d_w
 
                 // B) Orthogonalization (Modified Gram-Schmidt)
                 orthogonalize_mgs(j);
 
                 // C) Normalize new vector and add to basis
-                normalize_new_vector(j);
+                bool ok = normalize_new_vector(j);
+                k_used = j + 1; // number of Arnoldi steps completed (basis size = k_used+1 vectors)
+                if (!ok) {
+                    // Arnoldi breakdown: stop expanding the basis
+                    break;
+                }
 
                 // D) Store H_m column (h_{1..j,j} and h_{j+1,j})
                 store_H_column(j);
             }
 
-            // After m steps:
-            // E) Compute small exponentiation on CPU: wH = exp(t*H_m)*e1
-            small_expm_and_lift();
+            // After steps (possibly fewer than m due to breakdown):
+            // E) Compute small exponentiation on CPU: wH = exp(t*H_m)*e1 using k_used columns
+            small_expm_and_lift(current_segment_t, k_used);
 
             // F) Evaluate residual and decide on restart
             {
                 NvtxRange check_range("restart_check");
-                last_residual = residual_estimate();
+                last_residual = residual_estimate(current_segment_t, k_used);
                 if (last_residual <= params.tol) {
                     converged = true;
-                    break; // Converged
-                } else {
-                    // If not converged, d_y (computed in small_expm_and_lift) becomes the new v for restart
-                    restart_from_y();
                 }
             }
 
-            ++restarts_done;
-            if (params.max_restarts > 0 && restarts_done >= params.max_restarts) {
-                break;
+            t_done += current_segment_t;
+            if (t_done >= total_t) {
+                break; // Completed total time horizon
             }
-            // If max_restarts <= 0, run until convergence
+
+            // Prepare for next time segment
+            restart_from_y();
+            ++step;
         }
+        restarts_done = step; // Number of restarts executed
 
         // G) Copy final y from device to host
         for (int i = 0; i < num_gpus; ++i) {
@@ -884,8 +902,8 @@ struct ArnoldiRunner {
                     }
                 } else {
                     // Peer copy from V_m[j] on src_gpu to d_q_full on dst_gpu
-                    cudaError_t err = cudaMemcpyPeerAsync(dst_dc.d_q_full + src_offset, dst_gpu,
-                                                   d_qj_src, src_gpu,
+                    cudaError_t err = cudaMemcpyPeerAsync(dst_dc.d_q_full + src_offset, dst_dc.device_id,
+                                                   d_qj_src, device_contexts[src_gpu].device_id,
                                                    sizeof(double) * src_size, dst_dc.stream_compute);
                     if (err != cudaSuccess) {
                         std::cerr << "ERROR in cudaMemcpyPeerAsync for j=" << j << ", dst_gpu=" << dst_gpu 
@@ -961,59 +979,6 @@ struct ArnoldiRunner {
                 std::cerr << "ERROR after SpMV on GPU " << i << ", j=" << j << ": " << cudaGetErrorString(err) << std::endl;
                 exit(EXIT_FAILURE);
             }
-        }
-
-        // Phase 2: Wait for ghost exchange to complete, then perform off-diag SpMV
-        // Create events to synchronize between ghost exchange and off-diag computation
-        std::vector<cudaEvent_t> ghost_ready_events(num_gpus);
-        for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-            CHECK_CUDA(cudaEventCreate(&ghost_ready_events[i]));
-            CHECK_CUDA(cudaEventRecord(ghost_ready_events[i], device_contexts[i].stream_comm));
-        }
-
-        // Phase 3: Off-diag SpMV using ghost data
-        for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-            DeviceContext& dc = device_contexts[i];
-            CSRHost::GhostMap& gm = ghost_maps[i];
-            
-            // Wait for ghost data to be ready
-            CHECK_CUDA(cudaStreamWaitEvent(dc.stream_compute, ghost_ready_events[i], 0));
-            
-            // Perform off-diag SpMV using ghost data
-            if (!gm.incoming_global_col_indices.empty()) {
-                int current_recv_buffer_idx = j % 2;
-                double* current_d_ghost_recv_buffer = dc.d_ghost_recv_buffer[current_recv_buffer_idx];
-                
-                // For each owner GPU, perform SpMV with ghost data and accumulate to d_w
-                for (auto const& [owner_id, peer_info] : gm.incoming_peer_info) {
-                    size_t offset = peer_info.first;
-                    size_t count = peer_info.second;
-                    
-                    if (count > 0) {
-                        // Create a temporary dense vector descriptor for ghost data
-                        cusparseDnVecDescr_t ghost_vec_descr;
-                        CHECK_CUSPARSE(cusparseCreateDnVec(&ghost_vec_descr, count, 
-                                                          current_d_ghost_recv_buffer + offset, CUDA_R_64F));
-                        
-                        // Create a temporary CSR descriptor for off-diag part
-                        // This is a simplified approach - in practice, you'd want to pre-build off-diag CSR matrices
-                        // For now, we'll use a simple AXPY operation to accumulate ghost contributions
-                        const double alpha = 1.0;
-                        CHECK_CUBLAS(cublasDaxpy(dc.cublas_handle, count, &alpha, 
-                                                current_d_ghost_recv_buffer + offset, 1, dc.d_w, 1));
-                        
-                        CHECK_CUSPARSE(cusparseDestroyDnVec(ghost_vec_descr));
-                    }
-                }
-            }
-        }
-
-        // Clean up events
-        for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-            CHECK_CUDA(cudaEventDestroy(ghost_ready_events[i]));
         }
         
     }
@@ -1158,8 +1123,7 @@ struct ArnoldiRunner {
         }
     }
 
-    void normalize_new_vector(int j) {
-
+    bool normalize_new_vector(int j) {
         // Phase 1: Compute local norms squared on each GPU
         std::vector<double> local_norms_squared(num_gpus);
         for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
@@ -1191,12 +1155,13 @@ struct ArnoldiRunner {
         double global_norm = std::sqrt(global_norm_squared);
         
         
-        // Check for zero or invalid norm
+        // Check for zero or invalid norm (Arnoldi breakdown)
         if (global_norm < 1e-14 || std::isnan(global_norm) || std::isinf(global_norm)) {
-            std::cerr << "ERROR: Invalid norm in normalize_new_vector for j=" << j << std::endl;
-            std::cerr << "  global_norm_squared = " << global_norm_squared << std::endl;
-            std::cerr << "  global_norm = " << global_norm << std::endl;
-            exit(EXIT_FAILURE);
+            // Set h_{j+1,j} = 0 to indicate breakdown and signal caller
+            if (j + 1 < params.m + 1) {
+                H_m(j + 1, j) = 0.0;
+            }
+            return false;
         }
 
         // Phase 3: Normalize w and store as q_{j+1} (next Arnoldi vector)
@@ -1228,6 +1193,7 @@ struct ArnoldiRunner {
         if (j + 1 < params.m + 1) {
             H_m(j + 1, j) = global_norm;
         }
+        return true;
     }
 
     void store_H_column(int j) {
@@ -1240,25 +1206,27 @@ struct ArnoldiRunner {
         std::cout << "    H_m column " << j << " stored. Current H_m size: " << H_m.rows() << "x" << H_m.cols() << std::endl;
     }
 
-    void small_expm_and_lift() {
+    void small_expm_and_lift(double segment_t, int k_used) {
         NvtxRange r_small("small_expm_and_lift");
+
+        // Guard: if no steps were performed (should not happen), skip
+        if (k_used <= 0) return;
 
         // Phase 1: Compute small matrix exponential on CPU using Eigen
         // Create e1 vector (first canonical basis vector)
-        e1 = Eigen::VectorXd::Zero(params.m + 1);
+        e1 = Eigen::VectorXd::Zero(k_used + 1);
         e1(0) = 1.0;
 
-        // Extract the m x m upper block of H_m (since H_m is (m+1) x m)
-        // We only need the first m rows for the exponential computation
-        Eigen::MatrixXd H_m_square = H_m.block(0, 0, params.m, params.m);
+        // Extract the k_used x k_used upper block of H_m
+        Eigen::MatrixXd H_m_square = H_m.block(0, 0, k_used, k_used);
         
         // Compute exp(t * H_m_square) using stable matrix exponential
-        Eigen::MatrixXd exp_tH_square = matrix_exp_stable(params.t * H_m_square);
+        Eigen::MatrixXd exp_tH_square = matrix_exp_stable(segment_t * H_m_square);
         
         // Extend to (m+1) x (m+1) for consistency
         // exp(t*H_m) is approximated by a block structure
-        Eigen::MatrixXd exp_tH = Eigen::MatrixXd::Zero(params.m + 1, params.m + 1);
-        exp_tH.block(0, 0, params.m, params.m) = exp_tH_square;
+        Eigen::MatrixXd exp_tH = Eigen::MatrixXd::Zero(k_used + 1, k_used + 1);
+        exp_tH.block(0, 0, k_used, k_used) = exp_tH_square;
         
         // Compute wH = exp(t * H_m) * e1
         // Since e1 has e1(0)=1 and rest=0, we only need the first column of exp_tH
@@ -1276,7 +1244,7 @@ struct ArnoldiRunner {
             
             // Compute y_local = V_m * wH using AXPY operations
             // y = sum_i (wH[i] * V_m[:, i])
-            for (int i = 0; i <= params.m; ++i) {
+            for (int i = 0; i <= k_used; ++i) {
                 if (std::abs(wH(i)) > 1e-15) { // Skip near-zero coefficients
                     const double alpha = v_norm * wH(i);
                     double* d_V_i = dc.d_V_m + i * dc.local_rows;
@@ -1287,19 +1255,20 @@ struct ArnoldiRunner {
         }
     }
 
-    double residual_estimate() {
-        // Residual-based convergence check: ||r_m|| ≈ |h_{m+1,m}| * ||e_m^T * exp(t*H_m) * e1||
-        Eigen::MatrixXd H_m_square = H_m.block(0, 0, params.m, params.m);
-        Eigen::MatrixXd exp_tH_square = matrix_exp_stable(params.t * H_m_square);
+    double residual_estimate(double segment_t, int k_used) {
+        if (k_used <= 0) return 0.0;
+        // Residual-based convergence check: ||r|| ≈ |h_{k,k-1}| * ||e_k^T * exp(t*H_k) * e1||
+        Eigen::MatrixXd H_m_square = H_m.block(0, 0, k_used, k_used);
+        Eigen::MatrixXd exp_tH_square = matrix_exp_stable(segment_t * H_m_square);
 
-        Eigen::VectorXd e1_small = Eigen::VectorXd::Zero(params.m);
+        Eigen::VectorXd e1_small = Eigen::VectorXd::Zero(k_used);
         e1_small(0) = 1.0;
 
         Eigen::VectorXd exp_tH_e1 = exp_tH_square * e1_small;
-        double e_m_exp_tH_e1 = exp_tH_e1(params.m - 1);
+        double e_k_exp_tH_e1 = exp_tH_e1(k_used - 1);
 
-        double h_m_plus_1_m = H_m(params.m, params.m - 1);
-        double residual_norm = std::abs(h_m_plus_1_m * e_m_exp_tH_e1);
+        double h_k_plus_1_k = H_m(k_used, k_used - 1);
+        double residual_norm = std::abs(h_k_plus_1_k * e_k_exp_tH_e1);
 
         return residual_norm;
     }
