@@ -251,7 +251,7 @@ fi
 nsys profile \\
     --output="\$PROFILE_OUTPUT" \\
     --force-overwrite=true \\
-    --trace=cuda,nvtx,osrt \\
+    --trace=cuda,nvtx,cublas,osrt \\
     --stats=true \\
     --cuda-memory-usage=true \\
     ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
