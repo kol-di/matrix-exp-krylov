@@ -18,23 +18,22 @@ GPUS=2
 TIME="00:05:00"
 SIZE=1000
 MATRIX_FILE=""
-LOG_DIR=${LOG_DIR:-"logs"}
-PROFILE_DIR=${PROFILE_DIR:-"$LOG_DIR/profiles"}
+PROFILER="nsys"  # nsys | ncu | none
+LOG_ROOT=${LOG_ROOT:-"logs"}
+RUNTIME_LOG_DIR="$LOG_ROOT/runtime"
+NSYS_DIR="$LOG_ROOT/nsys_profiles"
+NCU_DIR="$LOG_ROOT/ncu_profiles"
 M_PARAM=""
 T_PARAM=""
 MAX_RESTARTS_PARAM=""
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 # Resolve paths relative to project root (so they don't end up under build/)
-if [[ "$LOG_DIR" = /* ]]; then
-  LOG_DIR_RES="$LOG_DIR"
-else
-  LOG_DIR_RES="$PROJECT_ROOT/$LOG_DIR"
-fi
-if [[ "$PROFILE_DIR" = /* ]]; then
-  PROFILE_DIR_RES="$PROFILE_DIR"
-else
-  PROFILE_DIR_RES="$PROJECT_ROOT/$PROFILE_DIR"
-fi
+for d in LOG_ROOT RUNTIME_LOG_DIR NSYS_DIR NCU_DIR; do
+  val="${!d}"
+  if [[ "$val" != /* ]]; then
+    eval "$d=\"$PROJECT_ROOT/$val\""
+  fi
+done
 
 # Parse arguments
 # If first argument starts with '--', use named arguments
@@ -69,11 +68,15 @@ if [[ $# -gt 0 && "$1" == --* ]]; then
                 MAX_RESTARTS_PARAM="$2"
                 shift 2
                 ;;
+            --profiler)
+                PROFILER="$2"
+                shift 2
+                ;;
             *)
                 echo "Unknown option: $1"
                 echo "Usage: ./launch.sh [gpus] [time] [size|matrix_file]"
-                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K]"
-                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K]"
+                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none]"
+                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none]"
                 exit 1
                 ;;
         esac
@@ -113,13 +116,16 @@ echo "=== Simple Matrix Exponential Job Launcher ==="
 echo "Configuration:"
 echo "  GPUs: $GPUS"
 echo "  Time limit: $TIME"
+echo "  Profiler: $PROFILER"
 if [[ -n "$MATRIX_FILE" ]]; then
     echo "  Matrix file: $MATRIX_FILE"
 else
     echo "  Matrix size: $SIZE"
 fi
-echo "  Logs dir: $LOG_DIR_RES"
-echo "  Profiles dir: $PROFILE_DIR_RES"
+echo "  Logs dir: $LOG_ROOT"
+echo "  Runtime logs: $RUNTIME_LOG_DIR"
+echo "  Nsight Systems dir: $NSYS_DIR"
+echo "  Nsight Compute dir: $NCU_DIR"
 if [[ -n "$M_PARAM" ]]; then
     echo "  Arnoldi m: $M_PARAM"
 fi
@@ -132,8 +138,7 @@ fi
 echo ""
 
 # Ensure log/profile directories exist (submission side)
-mkdir -p "$LOG_DIR_RES"
-mkdir -p "$PROFILE_DIR_RES"
+mkdir -p "$RUNTIME_LOG_DIR" "$NSYS_DIR" "$NCU_DIR"
 
 # Create temporary SLURM script
 TEMP_SLURM=$(mktemp)
@@ -146,8 +151,8 @@ cat > "$TEMP_SLURM" << EOF
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:$GPUS
 #SBATCH --time=$TIME
-#SBATCH --output=${LOG_DIR_RES}/matrix_exp_%j.out
-#SBATCH --error=${LOG_DIR_RES}/matrix_exp_%j.err
+#SBATCH --output=${RUNTIME_LOG_DIR}/matrix_exp_%j.out
+#SBATCH --error=${RUNTIME_LOG_DIR}/matrix_exp_%j.err
 
 echo "=== Matrix Exponential SLURM Job ==="
 echo "Job ID: \$SLURM_JOB_ID"
@@ -190,22 +195,12 @@ if [ ! -f "./build/matrix_exp" ]; then
     fi
 fi
 
-echo "Running matrix exponential computation with Nsight Systems profiling..."
+echo "Running matrix exponential computation with profiler: $PROFILER"
 if [[ -n "$MATRIX_FILE" ]]; then
 echo "Matrix file: $MATRIX_FILE"
 else
 echo "Matrix size: $SIZE"
 fi
-echo ""
-
-# Check if nsys is available
-if ! command -v nsys &> /dev/null; then
-    echo "ERROR: nsys not found. Make sure CUDA module is loaded."
-    exit 1
-fi
-
-echo "Nsight Systems version:"
-nsys --version
 echo ""
 
 # Prepare matrix file if provided
@@ -230,11 +225,7 @@ fi
 
 # Run the program with nsys profiling
 cd build
-PROFILE_OUTPUT="${PROFILE_DIR_RES}/matrix_exp_profile_\${SLURM_JOB_ID}"
-echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
-echo "Executable command: ./matrix_exp \"\$ACTUAL_ARG\" \$EXTRA_ARGS"
-echo ""
-echo ""
+PROFILE_EXIT_CODE=0
 
 # Build extra args for Arnoldi params
 EXTRA_ARGS=""
@@ -248,15 +239,49 @@ if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
     EXTRA_ARGS+=" --max-restarts $MAX_RESTARTS_PARAM"
 fi
 
-nsys profile \\
-    --output="\$PROFILE_OUTPUT" \\
-    --force-overwrite=true \\
-    --trace=cuda,nvtx,cublas,osrt \\
-    --stats=true \\
-    --cuda-memory-usage=true \\
+if [[ "$PROFILER" == "nsys" ]]; then
+    # Check nsys
+    if ! command -v nsys &> /dev/null; then
+        echo "ERROR: nsys not found. Make sure CUDA module is loaded."
+        exit 1
+    fi
+    echo "Nsight Systems version:"
+    nsys --version
+    echo ""
+    PROFILE_OUTPUT="${NSYS_DIR}/matrix_exp_profile_\${SLURM_JOB_ID}"
+    echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
+    nsys profile \\
+        --output="\$PROFILE_OUTPUT" \\
+        --force-overwrite=true \\
+        --trace=cuda,nvtx,cublas,osrt \\
+        --stats=true \\
+        --cuda-memory-usage=true \\
+        ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
+    PROFILE_EXIT_CODE=\$?
+elif [[ "$PROFILER" == "ncu" ]]; then
+    # Check ncu
+    if ! command -v ncu &> /dev/null; then
+        echo "ERROR: ncu not found. Make sure CUDA module is loaded."
+        exit 1
+    fi
+    echo "Nsight Compute version:"
+    ncu --version
+    echo ""
+    PROFILE_OUTPUT="${NCU_DIR}/matrix_exp_profile_\${SLURM_JOB_ID}"
+    echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.ncu-rep"
+    # Focus on kernels inside NVTX range total_compute_expmv and collect flop-related metrics
+    ncu \\
+        --target-processes all \\
+        --nvtx \\
+        --metrics \"sm__sass_thread_inst_executed_ops_fadd_pred_on.sum,sm__sass_thread_inst_executed_ops_ffma_pred_on.sum,sm__sass_thread_inst_executed_ops_fmul_pred_on.sum,sm__sass_thread_inst_executed_ops_dadd_pred_on.sum,sm__sass_thread_inst_executed_ops_dfma_pred_on.sum,sm__sass_thread_inst_executed_ops_dmul_pred_on.sum\" \\
+        --export \"\$PROFILE_OUTPUT\" \\
+        ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
+    PROFILE_EXIT_CODE=\$?
+else
+    echo "Profiler disabled; running binary directly."
     ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
-
-PROFILE_EXIT_CODE=\$?
+    PROFILE_EXIT_CODE=\$?
+fi
 
 # Check exit status
 if [ \$PROFILE_EXIT_CODE -eq 0 ]; then
