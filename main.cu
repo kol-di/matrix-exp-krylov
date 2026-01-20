@@ -556,12 +556,34 @@ struct ArnoldiParams {
         : m(m_val), t(t_val), tol(tol_val), max_restarts(max_restarts_val), reorthogonalize(reortho) {}
 };
 
+enum class ExpmvMode {
+    AdaptiveTimeStepping,
+    RestartedKrylov // future
+};
+
+struct TimeSteppingParams {
+    double dt_init{0.0};     // initial dt
+    double dt_min{0.0};      // minimal dt
+    double dt_max{0.0};      // maximal dt
+    double tol_step{0.0};    // local error tolerance
+    int max_steps{0};        // safety cap on accepted steps
+    int max_rejects{20};     // max rejects per step
+    double safety{0.8};      // safety factor for dt update
+    double grow{1.5};        // dt growth factor
+    double shrink{0.5};      // dt shrink factor
+    bool adapt_m{false};     // allow increasing m
+    int m_max{0};            // upper bound for m when adapting
+    int m_step{0};           // increment for m when adapting
+};
+
 // ArnoldiRunner class: High-level orchestrator
 struct ArnoldiRunner {
     int num_gpus;
     std::vector<DeviceContext> device_contexts;
     NcclContext nccl_context;
     ArnoldiParams params;
+    ExpmvMode mode{ExpmvMode::AdaptiveTimeStepping};
+    TimeSteppingParams ts_params;
     bool converged = false;
     int restarts_done = 0;
     double last_residual = 0.0;
@@ -594,6 +616,20 @@ struct ArnoldiRunner {
         for (int i = 0; i < num_gpus; ++i) {
             device_contexts.emplace_back(i);
         }
+        // Default time-stepping params derived from Arnoldi params
+        ts_params.dt_max = params.t;
+        ts_params.dt_min = std::max(1e-12, params.t * 1e-6);
+        double denom = (params.max_restarts > 0) ? params.max_restarts : 1;
+        ts_params.dt_init = params.t / static_cast<double>(denom);
+        ts_params.tol_step = params.tol;
+        ts_params.max_steps = (params.max_restarts > 0) ? params.max_restarts : 1000;
+        ts_params.max_rejects = 20;
+        ts_params.safety = 0.8;
+        ts_params.grow = 1.5;
+        ts_params.shrink = 0.5;
+        ts_params.adapt_m = false;
+        ts_params.m_max = params.m;
+        ts_params.m_step = 0;
     }
 
     void init_all_devices(const std::vector<CSRHost>& partitions, const std::vector<int>& device_ids, const std::vector<CSRHost::GhostMap>& ghost_maps_in) {
@@ -635,75 +671,107 @@ struct ArnoldiRunner {
     void compute_expmv(const std::vector<double>& v_host, std::vector<double>& y_host) {
         NvtxRange total_range("total_compute_expmv");
         // Full procedure: normalize q1 -> Arnoldi restarts -> small exponentiation -> lift -> restart/finish
-        // This will be the main orchestration method.
         // Details will be filled in subsequent steps.
         // 1. Initialize q1 (norm of v and scale v)
         init_q1(v_host);
 
-        // 2. Arnoldi iterations (main loop with restarts / time-splitting)
-        restarts_done = 0;
+        if (mode != ExpmvMode::AdaptiveTimeStepping) {
+            std::cerr << "Expmv mode not implemented" << std::endl;
+            return;
+        }
+
+        // === Adaptive time-stepping parameters ===
+        double total_t = params.t;
+        double dt = std::min(std::max(ts_params.dt_init, ts_params.dt_min), ts_params.dt_max);
+        double t_done = 0.0;
+        int accepted_steps = 0;
         converged = false;
 
-        // Split total time into segments to avoid repeated application of exp(tA)
-        double total_t = params.t;
-        int total_steps = (params.max_restarts > 0) ? (params.max_restarts + 1) : 1;
-        double base_segment_t = total_t / static_cast<double>(total_steps);
-        double t_done = 0.0;
-        int step = 0;
-        while (step < total_steps && t_done < total_t) {
-            NvtxRange restart_range("arnoldi_iter");
-            // Use base segment length, last step absorbs any remainder to hit total_t exactly.
-            current_segment_t = (step == total_steps - 1) ? (total_t - t_done) : std::min(base_segment_t, total_t - t_done);
+        while (t_done < total_t && accepted_steps < ts_params.max_steps) {
+            dt = std::min(dt, total_t - t_done);
+            int rejects = 0;
+            int m_current = params.m;
 
-            // Reset H_m for new Arnoldi run
-            H_m.setZero(params.m + 1, params.m);
-            int k_used = 0; // actual Krylov dimension used this segment
+            while (true) {
+                NvtxRange r_step("arnoldi_step_attempt");
+                // Resize H for current m
+                H_m.setZero(m_current + 1, m_current);
+                int k_used = 0;
+                bool breakdown = false;
 
-            // Arnoldi loop for j = 1 to m
-            for (int j = 0; j < params.m; ++j) {
-                // A) Prepare q_j (ghost exchange and on-diag SpMV)
-                spmv_on_off(j);       // Compute A*q_j and store in d_w
-
-                // B) Orthogonalization (Modified Gram-Schmidt)
-                orthogonalize_mgs(j);
-
-                // C) Normalize new vector and add to basis
-                bool ok = normalize_new_vector(j);
-                k_used = j + 1; // number of Arnoldi steps completed (basis size = k_used+1 vectors)
-                if (!ok) {
-                    // Arnoldi breakdown: stop expanding the basis
-                    break;
+                // Build Arnoldi basis of length m_current
+                for (int j = 0; j < m_current; ++j) {
+                    // A) Prepare q_j (ghost exchange and on-diag SpMV)
+                    spmv_on_off(j);
+                    // B) Orthogonalization (Modified Gram-Schmidt)
+                    orthogonalize_mgs(j);
+                    // C) Normalize new vector and add to basis
+                    bool ok = normalize_new_vector(j);
+                    k_used = j + 1;
+                    // D) Store H_m column
+                    store_H_column(j);
+                    if (!ok) { breakdown = true; break; }
                 }
 
-                // D) Store H_m column (h_{1..j,j} and h_{j+1,j})
-                store_H_column(j);
-            }
+                // E) Compute small exponentiation on CPU
+                small_expm_and_lift(dt, k_used);
+                double err = residual_estimate(dt, k_used);
+                if (breakdown) {
+                    err = 0.0; // treat breakdown as convergence within subspace
+                }
 
-            // After steps (possibly fewer than m due to breakdown):
-            // E) Compute small exponentiation on CPU: wH = exp(t*H_m)*e1 using k_used columns
-            small_expm_and_lift(current_segment_t, k_used);
+                std::cout << "[STEP] t=" << t_done << " dt=" << dt
+                          << " err=" << err << " m_used=" << k_used
+                          << " accepts=" << accepted_steps
+                          << " rejects=" << rejects << std::endl;
 
-            // F) Evaluate residual and decide on restart
-            {
-                NvtxRange check_range("restart_check");
-                last_residual = residual_estimate(current_segment_t, k_used);
-                if (last_residual <= params.tol) {
-                    converged = true;
+                if (err <= ts_params.tol_step || breakdown) {
+                    // ACCEPT
+                    t_done += dt;
+                    accepted_steps++;
+                    last_residual = err;
+
+                    // If finished total time, keep d_y as final result and exit outer loop
+                    if (t_done >= total_t) {
+                        converged = true;
+                        break;
+                    }
+
+                    // Prepare next step start vector
+                    restart_from_y();
+
+                    // Adapt dt up
+                    if (err < 0.1 * ts_params.tol_step) {
+                        double dt_new = dt * ts_params.grow * ts_params.safety;
+                        dt = std::min(dt_new, ts_params.dt_max);
+                    }
+                    break; // proceed to next accepted step
+                } else {
+                    // REJECT
+                    rejects++;
+                    if (rejects >= ts_params.max_rejects) {
+                        std::cerr << "[STEP] rejected too many times, aborting" << std::endl;
+                        converged = false;
+                        last_residual = err;
+                        t_done = total_t; // force exit outer
+                        break;
+                    }
+                    if (ts_params.adapt_m && (m_current + ts_params.m_step) <= ts_params.m_max && ts_params.m_step > 0) {
+                        m_current += ts_params.m_step;
+                    } else {
+                        double dt_new = std::max(dt * ts_params.shrink * ts_params.safety, ts_params.dt_min);
+                        dt = dt_new;
+                        m_current = params.m;
+                    }
+                    // retry same time with new dt/m
+                    continue;
                 }
             }
-
-            t_done += current_segment_t;
-            if (t_done >= total_t) {
-                break; // Completed total time horizon
-            }
-
-            // Prepare for next time segment
-            restart_from_y();
-            ++step;
         }
-        restarts_done = step; // Number of restarts executed
 
-        // G) Copy final y from device to host
+        restarts_done = accepted_steps; // in this mode: number of accepted time steps
+
+        // Copy final y (in d_y) to host
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(i));
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute)); // Ensure all compute is done
@@ -714,22 +782,16 @@ struct ArnoldiRunner {
                                        cudaMemcpyDeviceToHost, 
                                        device_contexts[i].stream_compute));
         }
-        // Need to synchronize all streams before y_host is fully ready.
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(i));
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute));
         }
 
-        // === FLOP accounting (analytic, assumes fixed m steps per segment, no breakdown) ===
-        // Assumptions:
-        //  - Total time horizon t split into S = max_restarts + 1 segments
-        //  - Each segment executes exactly m Arnoldi steps (no adaptive stopping)
-        //  - Breakdown ignored: k_used = m always
-        //  - Formulas per provided spec
+        // FLOPs (approx, assumes fixed m per step, k_used=m)
         const double N = static_cast<double>(global_rows);
         const double nnz = static_cast<double>(global_nnz);
         const double m_val = static_cast<double>(params.m);
-        const double S = (params.max_restarts > 0) ? static_cast<double>(params.max_restarts + 1) : 1.0;
+        const double S = static_cast<double>(accepted_steps);
 
         const double flops_gpu_segment =
               2.0 * nnz * m_val                 // SpMV
@@ -747,13 +809,12 @@ struct ArnoldiRunner {
 
         const double flops_cpu_total = S * flops_cpu_segment;
 
-        std::cout << "[FLOPs] N=" << N << " nnz=" << nnz << " m=" << m_val << " S=" << S << std::endl;
+        std::cout << "[FLOPs] N=" << N << " nnz=" << nnz << " m=" << m_val << " steps=" << S << std::endl;
         std::cout << "[FLOPs] GPU segment: " << flops_gpu_segment
                   << " | GPU total: " << flops_gpu_total << std::endl;
         std::cout << "[FLOPs] CPU segment: " << flops_cpu_segment
                   << " | CPU total: " << flops_cpu_total
                   << " (C_exp=" << C_EXP_FLOP_FACTOR << ")" << std::endl;
-
     }
 
     // Internal methods (details to be implemented)
@@ -1020,7 +1081,7 @@ struct ArnoldiRunner {
     }
 
     void orthogonalize_mgs(int j) {
-        
+        NvtxRange r_ortho("orthogonalize_mgs");
 
         // Modified Gram-Schmidt orthogonalization: w = w - sum_i (h_{i,j} * q_i)
         for (int i = 0; i <= j; ++i) {
