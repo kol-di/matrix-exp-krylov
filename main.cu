@@ -72,6 +72,7 @@ struct NvtxRange {
 // Global constants
 const double ARNOLDI_TOL = 1e-8; // Tolerance for Arnoldi residual
 const int MAX_RESTARTS = 10;     // Default maximum number of restarts
+const double C_EXP_FLOP_FACTOR = 1.0; // Heuristic factor for CPU expm cost (scaling-squaring/Pade), per spec
 
 // CSRHost class for host-side matrix handling
 struct CSRHost {
@@ -576,6 +577,7 @@ struct ArnoldiRunner {
     // Global matrix dimensions
     int global_rows;
     int global_cols;
+    long long global_nnz;
 
     // Helper to get global row offset for a given GPU
     int get_global_row_offset(int gpu_id) const {
@@ -586,8 +588,8 @@ struct ArnoldiRunner {
         return offset;
     }
 
-    ArnoldiRunner(int n_gpus, const ArnoldiParams& arnoldi_params, int total_rows, int total_cols)
-        : num_gpus(n_gpus), nccl_context(n_gpus), params(arnoldi_params), global_rows(total_rows), global_cols(total_cols) {
+    ArnoldiRunner(int n_gpus, const ArnoldiParams& arnoldi_params, int total_rows, int total_cols, long long total_nnz)
+        : num_gpus(n_gpus), nccl_context(n_gpus), params(arnoldi_params), global_rows(total_rows), global_cols(total_cols), global_nnz(total_nnz) {
         device_contexts.reserve(num_gpus);
         for (int i = 0; i < num_gpus; ++i) {
             device_contexts.emplace_back(i);
@@ -717,6 +719,40 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaSetDevice(i));
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute));
         }
+
+        // === FLOP accounting (analytic, assumes fixed m steps per segment, no breakdown) ===
+        // Assumptions:
+        //  - Total time horizon t split into S = max_restarts + 1 segments
+        //  - Each segment executes exactly m Arnoldi steps (no adaptive stopping)
+        //  - Breakdown ignored: k_used = m always
+        //  - Formulas per provided spec
+        const double N = static_cast<double>(global_rows);
+        const double nnz = static_cast<double>(global_nnz);
+        const double m_val = static_cast<double>(params.m);
+        const double S = (params.max_restarts > 0) ? static_cast<double>(params.max_restarts + 1) : 1.0;
+
+        const double flops_gpu_segment =
+              2.0 * nnz * m_val                 // SpMV
+            + 4.0 * N * m_val * (m_val + 1.0)   // MGS + reorthogonalization
+            + 5.0 * N * m_val                   // normalize + lift
+            + 2.0 * N;                          // service vector ops
+
+        const double flops_gpu_total =
+              3.0 * N * S                        // init_q1 + restart_from_y
+            + S * flops_gpu_segment;
+
+        const double flops_cpu_segment =
+              2.0 * C_EXP_FLOP_FACTOR * m_val * m_val * m_val   // exp(t*H) ~ O(m^3)
+            + 2.0 * m_val * m_val;                              // small gemv + misc
+
+        const double flops_cpu_total = S * flops_cpu_segment;
+
+        std::cout << "[FLOPs] N=" << N << " nnz=" << nnz << " m=" << m_val << " S=" << S << std::endl;
+        std::cout << "[FLOPs] GPU segment: " << flops_gpu_segment
+                  << " | GPU total: " << flops_gpu_total << std::endl;
+        std::cout << "[FLOPs] CPU segment: " << flops_cpu_segment
+                  << " | CPU total: " << flops_cpu_total
+                  << " (C_exp=" << C_EXP_FLOP_FACTOR << ")" << std::endl;
 
     }
 
@@ -1487,7 +1523,7 @@ int main(int argc, char* argv[]) {
                   << std::endl;
 
         // Create ArnoldiRunner
-        ArnoldiRunner runner(num_gpus_to_use, params, test_matrix.rows, test_matrix.cols);
+        ArnoldiRunner runner(num_gpus_to_use, params, test_matrix.rows, test_matrix.cols, test_matrix.nnz);
         
         // Initialize all devices
         runner.init_all_devices(partitions, device_ids, ghost_maps);
