@@ -374,6 +374,7 @@ struct DeviceContext {
     double* h_pinned_h;
     size_t h_pinned_capacity;
     size_t h_pinned_stride;   // stride between h_first and h_corr (m_arnoldi+1)
+    cudaEvent_t send_ready;   // event to signal send buffer readiness
 
     // On/off-diagonal CSR storage
     int* d_row_ptr_on;
@@ -400,6 +401,7 @@ struct DeviceContext {
         d_scalar_host_ptr(nullptr), d_scalar_device(nullptr), d_scalar_device_aux(nullptr),
         d_spmv_buffer(nullptr), spmv_buffer_size(0),
         h_pinned_h(nullptr), h_pinned_capacity(0), h_pinned_stride(0),
+        send_ready(nullptr),
         d_row_ptr_on(nullptr), d_col_idx_on(nullptr), d_values_on(nullptr),
         d_row_ptr_off(nullptr), d_col_idx_off(nullptr), d_values_off(nullptr),
         d_outgoing_global_col_indices(nullptr), d_incoming_global_col_indices(nullptr)
@@ -432,10 +434,13 @@ struct DeviceContext {
         // Create events for ghost readiness (no timing to reduce overhead)
         CHECK_CUDA(cudaEventCreateWithFlags(&ghost_recv_ready[0], cudaEventDisableTiming));
         CHECK_CUDA(cudaEventCreateWithFlags(&ghost_recv_ready[1], cudaEventDisableTiming));
+        CHECK_CUDA(cudaEventCreateWithFlags(&send_ready, cudaEventDisableTiming));
     }
 
     // Allocate device memory and copy CSR partition from host
-    void alloc_from(const CSRHost& part, int global_cols, int m_arnoldi) {
+    int allocated_m_max; // tracks allocation bound for V_m/pinned buffers
+
+    void alloc_from(const CSRHost& part, int global_cols, int m_alloc_max) {
         CHECK_CUDA(cudaSetDevice(device_id));
 
         local_rows = part.rows;
@@ -460,9 +465,9 @@ struct DeviceContext {
         CHECK_CUDA(cudaMalloc(&d_q, sizeof(double) * local_rows));
         CHECK_CUDA(cudaMalloc(&d_w, sizeof(double) * local_rows));
         CHECK_CUDA(cudaMalloc(&d_y, sizeof(double) * local_rows));
-        // V_m sized exactly for requested Arnoldi dimension (m_arnoldi + 1 vectors)
-        int safe_m = std::max(1, m_arnoldi);
-        CHECK_CUDA(cudaMalloc(&d_V_m, sizeof(double) * local_rows * (safe_m + 1)));
+        // V_m sized for maximum planned Arnoldi dimension (m_alloc_max + 1 vectors)
+        allocated_m_max = std::max(1, m_alloc_max);
+        CHECK_CUDA(cudaMalloc(&d_V_m, sizeof(double) * local_rows * (allocated_m_max + 1)));
 
         // Allocate pinned host memory for scalar reduction results
         CHECK_CUDA(cudaMallocHost(&d_scalar_host_ptr, sizeof(double)));
@@ -472,13 +477,14 @@ struct DeviceContext {
     }
 
     // Create cuSPARSE descriptors (on/off split) and allocate ghost buffers
-    void create_descriptors(const CSRHost& part, int global_cols, const CSRHost::GhostMap& ghost_map, int global_row_offset, int m_arnoldi) {
+    void create_descriptors(const CSRHost& part, int global_cols, const CSRHost::GhostMap& ghost_map, int global_row_offset, int /*m_arnoldi*/) {
         CHECK_CUDA(cudaSetDevice(device_id));
         (void)global_cols;
-        (void)m_arnoldi;
         // Allocate pinned buffer for h_ij:
-        // layout: [ h_first (m_arnoldi+1) | h_corr (m_arnoldi+1) ]
-        h_pinned_stride = static_cast<size_t>(m_arnoldi + 1);
+        // layout: [ h_first (m_alloc_max+1) | h_corr (m_alloc_max+1) ]
+        // reuse m_alloc_max as the stride basis
+        int stride_basis = std::max(1, allocated_m_max);
+        h_pinned_stride = static_cast<size_t>(stride_basis + 1);
         size_t needed = 2 * h_pinned_stride;
         if (h_pinned_capacity < needed) {
             if (h_pinned_h) {
@@ -674,6 +680,7 @@ struct DeviceContext {
         if (stream_reduce) CHECK_CUDA(cudaStreamDestroy(stream_reduce));
         if (ghost_recv_ready[0]) CHECK_CUDA(cudaEventDestroy(ghost_recv_ready[0]));
         if (ghost_recv_ready[1]) CHECK_CUDA(cudaEventDestroy(ghost_recv_ready[1]));
+        if (send_ready) CHECK_CUDA(cudaEventDestroy(send_ready));
 
         if (h_pinned_h) CHECK_CUDA(cudaFreeHost(h_pinned_h));
     }
@@ -842,13 +849,19 @@ struct ArnoldiRunner {
                       << " must be less than global_rows=" << global_rows << std::endl;
             exit(EXIT_FAILURE);
         }
+        // Invariant: matrix must be square, and row/col ownership matches row partition
+        if (global_rows != global_cols) {
+            std::cerr << "ERROR: Matrix must be square. rows=" << global_rows << " cols=" << global_cols << std::endl;
+            exit(EXIT_FAILURE);
+        }
 
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(i)); // Set device before initializing context
             device_contexts[i].init_handles();
             device_contexts[i].create_streams();
-            device_contexts[i].alloc_from(partitions[i], global_cols, params.m);
-            device_contexts[i].create_descriptors(partitions[i], global_cols, ghost_maps[i], get_global_row_offset(i), params.m); // Pass m_arnoldi
+            int alloc_m = std::max(params.m, ts_params.m_max > 0 ? ts_params.m_max : params.m);
+            device_contexts[i].alloc_from(partitions[i], global_cols, alloc_m);
+            device_contexts[i].create_descriptors(partitions[i], global_cols, ghost_maps[i], get_global_row_offset(i), alloc_m); // Pass alloc_m
             // Enable peer access between all pairs of GPUs
             for (int j = 0; j < num_gpus; ++j) {
                 if (i != j) {
@@ -1087,57 +1100,58 @@ struct ArnoldiRunner {
 
     void ghost_exchange_qj(int j) {
 
-        // Phase 1: Each GPU gathers its outgoing ghost data into its d_ghost_send_buffer
-        for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-            DeviceContext& dc = device_contexts[i];
-            CSRHost::GhostMap& gm = ghost_maps[i];
+        // Phase 1: owners gather into send buffers in their own comm stream
+        for (int owner = 0; owner < num_gpus; ++owner) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[owner].device_id));
+            DeviceContext& dc_owner = device_contexts[owner];
+            CSRHost::GhostMap& gm_owner = ghost_maps[owner];
 
-            if (gm.outgoing_global_col_indices.empty()) continue; // Nothing to send
+            if (gm_owner.outgoing_global_col_indices.empty()) continue;
 
-            double* d_qj_local = dc.d_V_m + j * dc.local_rows;
-            int blocks = (gm.outgoing_global_col_indices.size() + 255) / 256;
-            gather_q_elements_for_send_kernel<<<blocks, 256, 0, dc.stream_comm>>>(
+            double* d_qj_local = dc_owner.d_V_m + j * dc_owner.local_rows;
+            int blocks = (gm_owner.outgoing_global_col_indices.size() + 255) / 256;
+            gather_q_elements_for_send_kernel<<<blocks, 256, 0, dc_owner.stream_comm>>>(
                 d_qj_local,
-                dc.d_outgoing_global_col_indices,
-                dc.d_ghost_send_buffer,
-                static_cast<int>(gm.outgoing_global_col_indices.size()),
-                get_global_row_offset(i));
+                dc_owner.d_outgoing_global_col_indices,
+                dc_owner.d_ghost_send_buffer,
+                static_cast<int>(gm_owner.outgoing_global_col_indices.size()),
+                get_global_row_offset(owner));
             CHECK_CUDA(cudaGetLastError());
+            // Ensure gather finished before scheduling copies
+            CHECK_CUDA(cudaEventRecord(dc_owner.send_ready, dc_owner.stream_comm));
         }
 
-        // Phase 2: Perform p2p copies from send buffers to receive buffers
-        for (int i = 0; i < num_gpus; ++i) { // i is the receiving GPU (consumer)
-            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
-            DeviceContext& consumer_dc = device_contexts[i];
-            CSRHost::GhostMap& consumer_gm = ghost_maps[i];
-            int current_recv_buffer_idx = j % 2;
-            double* current_d_ghost_recv_buffer = consumer_dc.d_ghost_recv_buffer[current_recv_buffer_idx];
+        // Phase 2: enqueue all memcpy to each consumer, then one event per consumer buffer
+        for (int consumer = 0; consumer < num_gpus; ++consumer) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[consumer].device_id));
+            DeviceContext& dc_consumer = device_contexts[consumer];
+            CSRHost::GhostMap& gm_consumer = ghost_maps[consumer];
+            int buf_idx = j % 2;
+            double* recv_buf = dc_consumer.d_ghost_recv_buffer[buf_idx];
 
-            for (auto const& [owner_id, peer_info] : consumer_gm.incoming_peer_info) {
-                // owner_id is the sending GPU
-                size_t offset = peer_info.first;
+            bool enqueued_any = false;
+            for (auto const& [owner_id, peer_info] : gm_consumer.incoming_peer_info) {
+                size_t recv_offset = peer_info.first;
                 size_t count = peer_info.second;
+                if (count == 0) continue;
 
-                if (count > 0) {
-                    DeviceContext& owner_dc = device_contexts[owner_id];
-                    // Use owner_dc.d_ghost_send_buffer as source
-                    // The offset in owner_dc.d_ghost_send_buffer needs to be determined by what owner_id sends to i
-                    auto owner_it = ghost_maps[owner_id].outgoing_peer_info.find(i);
-                    if (owner_it == ghost_maps[owner_id].outgoing_peer_info.end()) {
-                        continue; // nothing to send for this pair
-                    }
-                    size_t owner_send_offset_for_this_consumer = owner_it->second.first;
-                    
-                    CHECK_CUDA(cudaMemcpyPeerAsync(current_d_ghost_recv_buffer + offset, consumer_dc.device_id, // dest
-                                                   owner_dc.d_ghost_send_buffer + owner_send_offset_for_this_consumer, owner_dc.device_id, // src
-                                                   sizeof(double) * count, consumer_dc.stream_comm));
-                }
+                CSRHost::GhostMap& gm_owner = ghost_maps[owner_id];
+                auto out_it = gm_owner.outgoing_peer_info.find(consumer);
+                if (out_it == gm_owner.outgoing_peer_info.end()) continue;
+                size_t send_offset = out_it->second.first;
+
+                DeviceContext& dc_owner = device_contexts[owner_id];
+                // Copies enqueued in consumer stream
+                CHECK_CUDA(cudaStreamWaitEvent(dc_consumer.stream_comm, dc_owner.send_ready, 0));
+                CHECK_CUDA(cudaMemcpyPeerAsync(recv_buf + recv_offset, dc_consumer.device_id,
+                                               dc_owner.d_ghost_send_buffer + send_offset, dc_owner.device_id,
+                                               sizeof(double) * count, dc_consumer.stream_comm));
+                enqueued_any = true;
             }
 
-            // Mark completion of receives for this buffer
-            if (consumer_dc.ghost_recv_ready[current_recv_buffer_idx]) {
-                CHECK_CUDA(cudaEventRecord(consumer_dc.ghost_recv_ready[current_recv_buffer_idx], consumer_dc.stream_comm));
+            // Always record a completion event (even if no copies) for this buffer
+            if (dc_consumer.ghost_recv_ready[buf_idx]) {
+                CHECK_CUDA(cudaEventRecord(dc_consumer.ghost_recv_ready[buf_idx], dc_consumer.stream_comm));
             }
         }
     }
@@ -1187,6 +1201,7 @@ struct ArnoldiRunner {
         NvtxRange r_ortho("orthogonalize_mgs");
 
         // Modified Gram-Schmidt orthogonalization: w = w - sum_i (h_{i,j} * q_i)
+        int m_lim = static_cast<int>(H_m.cols());
         // Use pinned host buffer on GPU0: first half = h_first, second half = h_corr (stride = h_pinned_stride)
         double* h_first = device_contexts[0].h_pinned_h;
         double* h_corr  = device_contexts[0].h_pinned_h ? device_contexts[0].h_pinned_h + device_contexts[0].h_pinned_stride : nullptr;
@@ -1203,8 +1218,12 @@ struct ArnoldiRunner {
                     std::cerr << "ERROR: MGS index out of order: i=" << i << " > j=" << j << std::endl;
                     exit(EXIT_FAILURE);
                 }
-                if (i > params.m) {
-                    std::cerr << "ERROR: Accessing V_m[" << i << "] but m=" << params.m << std::endl;
+                if (i >= m_lim) {
+                    std::cerr << "ERROR: Accessing V_m[" << i << "] but m_lim=" << m_lim << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+                if (i >= dc.allocated_m_max + 1) {
+                    std::cerr << "ERROR: V_m index exceeds allocation: i=" << i << " allocated_m_max=" << dc.allocated_m_max << std::endl;
                     exit(EXIT_FAILURE);
                 }
 
@@ -1280,7 +1299,7 @@ struct ArnoldiRunner {
         // Synchronize once and update H_m from buffered h_col
         CHECK_CUDA(cudaSetDevice(device_contexts[0].device_id));
         CHECK_CUDA(cudaStreamSynchronize(device_contexts[0].stream_compute));
-        for (int i = 0; i <= j && i < params.m; ++i) {
+        for (int i = 0; i <= j && i < m_lim; ++i) {
             double first = (h_first) ? h_first[i] : 0.0;
             double corr  = (h_corr)  ? h_corr[i]  : 0.0;
             H_m(i, j) = first + corr;
@@ -1321,9 +1340,9 @@ struct ArnoldiRunner {
 
         // Check for zero or invalid norm (Arnoldi breakdown)
         if (global_norm < 1e-14 || std::isnan(global_norm) || std::isinf(global_norm)) {
-            if (j + 1 < params.m + 1) {
-                H_m(j + 1, j) = 0.0;
-            }
+        if (j + 1 < H_m.rows() && j < H_m.cols()) {
+            H_m(j + 1, j) = 0.0;
+        }
             return false;
         }
 
@@ -1347,7 +1366,7 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[gpu_id].stream_compute));
         }
 
-        if (j + 1 < params.m + 1) {
+        if (j + 1 < H_m.rows() && j < H_m.cols()) {
             H_m(j + 1, j) = global_norm;
         }
         return true;
