@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <iterator>
 #include <cmath>
 #include <cstdlib>
 
@@ -89,7 +90,6 @@ struct CSRHost {
 
     // Method to read matrix from Matrix Market format
     void from_matrix_market(const std::string& filename) {
-        // Implementation will go here
         std::ifstream file(filename);
         if (!file.is_open()) {
             std::cerr << "Error: Could not open file " << filename << std::endl;
@@ -97,62 +97,144 @@ struct CSRHost {
         }
 
         std::string line;
-        // Skip comments and header lines
+        // === Parse header ===
+        bool header_parsed = false;
+        std::string field, symmetry, format, object;
         while (std::getline(file, line)) {
-            if (line[0] == '%') {
-                continue;
-            }
+            if (line.empty()) continue;
             std::stringstream ss(line);
-            std::string token;
-            ss >> token; // %%MatrixMarket
-            if (token == "%%MatrixMarket") {
-                ss >> token; // matrix
-                ss >> token; // coordinate
-                ss >> token; // real/integer
-                ss >> token; // general/symmetric
-                continue;
+            ss >> object;
+            // Normalize tokens to lowercase for robustness
+            std::transform(object.begin(), object.end(), object.begin(), ::tolower);
+            if (object != "%%matrixmarket") {
+                continue; // keep searching until header is found
             }
-            // Read dimensions and nnz
-            ss.clear();
-            ss.str(line);
-            ss >> rows >> cols >> nnz;
+            ss >> object >> format >> field >> symmetry;
+            std::transform(object.begin(), object.end(), object.begin(), ::tolower);
+            std::transform(format.begin(), format.end(), format.begin(), ::tolower);
+            std::transform(field.begin(), field.end(), field.begin(), ::tolower);
+            std::transform(symmetry.begin(), symmetry.end(), symmetry.begin(), ::tolower);
+            if (object != "matrix") {
+                std::cerr << "Error: MatrixMarket object must be 'matrix'" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            if (format != "coordinate") {
+                std::cerr << "Error: Only 'coordinate' format is supported" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            if (field != "real" && field != "pattern") {
+                std::cerr << "Error: Only 'real' or 'pattern' fields are supported" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            if (symmetry != "general" && symmetry != "symmetric") {
+                std::cerr << "Error: Only 'general' or 'symmetric' symmetry types are supported" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            header_parsed = true;
             break;
+        }
+
+        if (!header_parsed) {
+            std::cerr << "Error: Failed to parse MatrixMarket header" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        const bool is_pattern = (field == "pattern");
+        const bool is_symmetric = (symmetry == "symmetric");
+
+        // === Read size line (skip comments/empty) ===
+        bool dims_parsed = false;
+        while (std::getline(file, line)) {
+            if (line.empty() || line[0] == '%') continue;
+            std::stringstream ss(line);
+            if (!(ss >> rows >> cols >> nnz)) {
+                std::cerr << "Error: Failed to read matrix dimensions" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            dims_parsed = true;
+            break;
+        }
+        if (!dims_parsed) {
+            std::cerr << "Error: Matrix dimensions line not found in file " << filename << std::endl;
+            exit(EXIT_FAILURE);
         }
 
         row_ptr.assign(rows + 1, 0);
         std::vector<std::tuple<int, int, double>> entries;
-        entries.reserve(nnz);
+        entries.reserve(static_cast<size_t>(nnz) * (is_symmetric ? 2 : 1));
 
-        for (long long i = 0; i < nnz; ++i) {
+        long long read_entries = 0;
+        while (read_entries < nnz && std::getline(file, line)) {
+            if (line.empty() || line[0] == '%') continue;
+            std::stringstream ss(line);
             int r, c;
-            double val;
-            file >> r >> c >> val;
-            entries.emplace_back(r - 1, c - 1, val); // 0-indexed
+            double val = 1.0;
+            if (!(ss >> r >> c)) {
+                std::cerr << "Error: Failed to read row/col for entry " << read_entries << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            if (!is_pattern) {
+                if (!(ss >> val)) {
+                    std::cerr << "Error: Failed to read value for entry " << read_entries << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+            }
+            // Convert to 0-based indices
+            r -= 1;
+            c -= 1;
+            if (r < 0 || r >= rows || c < 0 || c >= cols) {
+                std::cerr << "Error: MatrixMarket index out of bounds r=" << (r + 1)
+                          << " c=" << (c + 1) << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            entries.emplace_back(r, c, val);
+            if (is_symmetric && r != c) {
+                entries.emplace_back(c, r, val);
+            }
+            ++read_entries;
         }
         file.close();
 
-        // Sort entries by row and then column
+        if (read_entries != nnz) {
+            std::cerr << "Error: Expected " << nnz << " entries but read " << read_entries << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        // Sort entries by row then column
         std::sort(entries.begin(), entries.end());
 
-        // Convert to CSR format
+        // Deduplicate by summing values of identical (row,col)
+        std::vector<std::tuple<int, int, double>> merged;
+        merged.reserve(entries.size());
+        for (const auto& e : entries) {
+            if (merged.empty() || std::get<0>(merged.back()) != std::get<0>(e) || std::get<1>(merged.back()) != std::get<1>(e)) {
+                merged.push_back(e);
+            } else {
+                std::get<2>(merged.back()) += std::get<2>(e);
+            }
+        }
+
+        nnz = static_cast<long long>(merged.size());
+        col_idx.clear();
+        values.clear();
         col_idx.reserve(nnz);
         values.reserve(nnz);
 
         int current_row = 0;
-        for (const auto& entry : entries) {
+        for (const auto& entry : merged) {
             int r, c;
             double val;
             std::tie(r, c, val) = entry;
 
             while (current_row < r) {
-                row_ptr[current_row + 1] = col_idx.size();
+                row_ptr[current_row + 1] = static_cast<int>(col_idx.size());
                 current_row++;
             }
             col_idx.push_back(c);
             values.push_back(val);
         }
         while (current_row < rows) {
-            row_ptr[current_row + 1] = col_idx.size();
+            row_ptr[current_row + 1] = static_cast<int>(col_idx.size());
             current_row++;
         }
     }
@@ -325,6 +407,58 @@ struct CSRHost {
         return ghost_map;
     }
 };
+
+// Validate that SEND and RECEIVE ghost plans are consistent between all GPU pairs
+void validate_ghost_maps(const std::vector<CSRHost::GhostMap>& ghost_maps, int num_gpus) {
+    auto normalize = [](std::vector<int> v) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        return v;
+    };
+    auto sample_vec = [](const std::vector<int>& v) {
+        std::ostringstream oss;
+        size_t limit = 10;
+        for (size_t i = 0; i < v.size() && i < limit; ++i) {
+            if (i > 0) oss << ",";
+            oss << v[i];
+        }
+        if (v.size() > limit) oss << " ...";
+        return oss.str();
+    };
+
+    for (int owner = 0; owner < num_gpus; ++owner) {
+        for (int consumer = 0; consumer < num_gpus; ++consumer) {
+            if (owner == consumer) continue;
+
+            std::vector<int> send, recv;
+            auto send_it = ghost_maps[owner].consumer_to_owner_map.find(consumer);
+            if (send_it != ghost_maps[owner].consumer_to_owner_map.end()) {
+                send = normalize(send_it->second);
+            }
+            auto recv_it = ghost_maps[consumer].owner_to_consumer_map.find(owner);
+            if (recv_it != ghost_maps[consumer].owner_to_consumer_map.end()) {
+                recv = normalize(recv_it->second);
+            }
+
+            if (send != recv) {
+                std::vector<int> diff_send, diff_recv;
+                std::set_difference(send.begin(), send.end(), recv.begin(), recv.end(), std::back_inserter(diff_send));
+                std::set_difference(recv.begin(), recv.end(), send.begin(), send.end(), std::back_inserter(diff_recv));
+
+                std::cerr << "[ERROR] Ghost map mismatch between owner " << owner
+                          << " and consumer " << consumer << std::endl;
+                std::cerr << "  send size: " << send.size() << " recv size: " << recv.size() << std::endl;
+                if (!diff_send.empty()) {
+                    std::cerr << "  Present only in send (first entries): " << sample_vec(diff_send) << std::endl;
+                }
+                if (!diff_recv.empty()) {
+                    std::cerr << "  Present only in recv (first entries): " << sample_vec(diff_recv) << std::endl;
+                }
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+}
 
 // DeviceContext class for GPU resource management
 struct DeviceContext {
@@ -843,6 +977,14 @@ struct ArnoldiRunner {
         nccl_context.init_all(device_ids);
         this->ghost_maps = ghost_maps_in; // Store ghost maps
 
+        if (static_cast<int>(device_ids.size()) != num_gpus) {
+            std::cerr << "ERROR: device_ids size (" << device_ids.size() << ") must match num_gpus (" << num_gpus << ")" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < num_gpus; ++i) {
+            device_contexts[i].device_id = device_ids[i];
+        }
+
         // Safety guard against invalid Arnoldi dimension (avoids buffer overruns in V_m)
         if (params.m >= global_rows) {
             std::cerr << "ERROR: Requested Arnoldi m=" << params.m 
@@ -856,7 +998,7 @@ struct ArnoldiRunner {
         }
 
         for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(i)); // Set device before initializing context
+            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id)); // Set device before initializing context
             device_contexts[i].init_handles();
             device_contexts[i].create_streams();
             int alloc_m = std::max(params.m, ts_params.m_max > 0 ? ts_params.m_max : params.m);
@@ -865,22 +1007,25 @@ struct ArnoldiRunner {
             // Enable peer access between all pairs of GPUs
             for (int j = 0; j < num_gpus; ++j) {
                 if (i != j) {
-                    CHECK_CUDA(cudaSetDevice(device_ids[i]));
+                    CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
                     
                     // Check if peer access is supported
                     int can_access;
-                    cudaError_t status = cudaDeviceCanAccessPeer(&can_access, device_ids[i], device_ids[j]);
+                    cudaError_t status = cudaDeviceCanAccessPeer(&can_access, device_contexts[i].device_id, device_contexts[j].device_id);
                     if (status == cudaSuccess && can_access) {
                         // Try to enable peer access, ignore if already enabled
-                        cudaError_t peer_status = cudaDeviceEnablePeerAccess(device_ids[j], 0);
+                        cudaError_t peer_status = cudaDeviceEnablePeerAccess(device_contexts[j].device_id, 0);
                         if (peer_status != cudaSuccess && peer_status != cudaErrorPeerAccessAlreadyEnabled) {
                             std::cerr << "Warning: Could not enable peer access between GPU " 
-                                      << device_ids[i] << " and GPU " << device_ids[j] 
+                                      << device_contexts[i].device_id << " and GPU " << device_contexts[j].device_id 
                                       << ": " << cudaGetErrorString(peer_status) << std::endl;
+                        } else if (peer_status == cudaErrorPeerAccessAlreadyEnabled) {
+                            // Clear sticky error flag
+                            cudaGetLastError();
                         }
                     } else {
                         std::cerr << "Warning: Peer access not supported between GPU " 
-                                  << device_ids[i] << " and GPU " << device_ids[j] << std::endl;
+                                  << device_contexts[i].device_id << " and GPU " << device_contexts[j].device_id << std::endl;
                     }
                 }
             }
@@ -915,6 +1060,13 @@ struct ArnoldiRunner {
                 NvtxRange r_step("arnoldi_step_attempt");
                 // Resize H for current m
                 H_m.setZero(m_current + 1, m_current);
+                for (int i = 0; i < num_gpus; ++i) {
+                    if (m_current > device_contexts[i].allocated_m_max) {
+                        std::cerr << "ERROR: m_current exceeds allocated_m_max on GPU "
+                                  << i << std::endl;
+                        exit(EXIT_FAILURE);
+                    }
+                }
                 int k_used = 0;
                 bool breakdown = false;
 
@@ -992,7 +1144,7 @@ struct ArnoldiRunner {
 
         // Copy final y (in d_y) to host
         for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(i));
+            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute)); // Ensure all compute is done
             int global_offset = get_global_row_offset(i);
             CHECK_CUDA(cudaMemcpyAsync(y_host.data() + global_offset,
@@ -1002,7 +1154,7 @@ struct ArnoldiRunner {
                                        device_contexts[i].stream_compute));
         }
         for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(i));
+            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             CHECK_CUDA(cudaStreamSynchronize(device_contexts[i].stream_compute));
         }
 
@@ -1040,7 +1192,7 @@ struct ArnoldiRunner {
     void init_q1(const std::vector<double>& v_host) {
         NvtxRange r_init("init_q1");
         for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(i));
+            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             int global_offset = get_global_row_offset(i);
 
@@ -1081,7 +1233,7 @@ struct ArnoldiRunner {
 
         // Scale d_q on each device
         for (int i = 0; i < num_gpus; ++i) {
-            CHECK_CUDA(cudaSetDevice(i));
+            CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             reciprocal_scalar_kernel<<<1, 1, 0, dc.stream_compute>>>(dc.d_scalar_device_aux);
             CHECK_CUBLAS(cublasDscal(dc.cublas_handle, dc.local_rows, dc.d_scalar_device_aux, dc.d_q, 1));
@@ -1129,7 +1281,6 @@ struct ArnoldiRunner {
             int buf_idx = j % 2;
             double* recv_buf = dc_consumer.d_ghost_recv_buffer[buf_idx];
 
-            bool enqueued_any = false;
             for (auto const& [owner_id, peer_info] : gm_consumer.incoming_peer_info) {
                 size_t recv_offset = peer_info.first;
                 size_t count = peer_info.second;
@@ -1146,7 +1297,6 @@ struct ArnoldiRunner {
                 CHECK_CUDA(cudaMemcpyPeerAsync(recv_buf + recv_offset, dc_consumer.device_id,
                                                dc_owner.d_ghost_send_buffer + send_offset, dc_owner.device_id,
                                                sizeof(double) * count, dc_consumer.stream_comm));
-                enqueued_any = true;
             }
 
             // Always record a completion event (even if no copies) for this buffer
@@ -1584,10 +1734,6 @@ int main(int argc, char* argv[]) {
 
         // Use available GPUs (limit to 4 for this example)
         int num_gpus_to_use = std::min(num_gpus, 4);
-        std::vector<int> device_ids(num_gpus_to_use);
-        for (int i = 0; i < num_gpus_to_use; ++i) {
-            device_ids[i] = i;
-        }
 
         // Prepare matrix
         CSRHost test_matrix;
@@ -1619,6 +1765,14 @@ int main(int argc, char* argv[]) {
                       << " with " << test_matrix.nnz << " non-zeros" << std::endl;
         }
 
+        // Prevent zero-row partitions (must precede device_ids allocation)
+        num_gpus_to_use = std::min(num_gpus_to_use, test_matrix.rows);
+
+        std::vector<int> device_ids(num_gpus_to_use);
+        for (int i = 0; i < num_gpus_to_use; ++i) {
+            device_ids[i] = i;
+        }
+
         // Quick sanity: clamp time step if matrix has huge entries to avoid exp overflow
         double max_abs_A = 0.0;
         for (double v : test_matrix.values) {
@@ -1645,6 +1799,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < num_gpus_to_use; ++i) {
             ghost_maps[i] = test_matrix.build_owner_ghost_maps(partitions, i, num_gpus_to_use);
         }
+        validate_ghost_maps(ghost_maps, num_gpus_to_use);
 
         // Set up Arnoldi parameters
         int m_val = m_param;
@@ -1676,6 +1831,22 @@ int main(int argc, char* argv[]) {
 
         // Compute exp(tA)v
         runner.compute_expmv(v_host, y_host);
+
+        // Optional: dump full y_host to a file if OUTPUT_Y_FILE is set
+        if (const char* out_path = std::getenv("OUTPUT_Y_FILE")) {
+            std::ofstream ofs(out_path);
+            if (!ofs) {
+                std::cerr << "Error: could not open OUTPUT_Y_FILE=" << out_path << " for writing" << std::endl;
+                return EXIT_FAILURE;
+            }
+            ofs.setf(std::ios::scientific);
+            ofs.precision(16);
+            for (double v : y_host) {
+                ofs << v << "\n";
+            }
+            ofs.close();
+            std::cout << "Saved y to " << out_path << std::endl;
+        }
 
         // Print some results
         std::cout << "Computation completed. Sample results:" << std::endl;
