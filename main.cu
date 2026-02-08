@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <iterator>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 // CUDA includes
@@ -478,7 +479,7 @@ struct DeviceContext {
     cusparseSpMatDescr_t matA_off_descr;
     cusparseDnVecDescr_t vec_v_descr, vec_w_descr, vec_y_descr;
     cusparseDnVecDescr_t vec_q_local_descr;
-    cusparseDnVecDescr_t vec_q_ghost_descr;
+    cusparseDnVecDescr_t vec_q_ghost_descr[2];
 
     // Device pointers for Arnoldi vectors and work vectors
     // V_m will store the Arnoldi basis vectors as columns
@@ -489,8 +490,10 @@ struct DeviceContext {
 
     // Ghost buffers for communication (double buffering)
     double* d_ghost_recv_buffer[2]; // Two buffers for double buffering
-    double* d_ghost_send_buffer;    // Buffer for sending ghost data
-    cudaEvent_t ghost_recv_ready[2]; // events to signal recv completion per buffer
+    double* d_ghost_send_buffer[2]; // Two buffers for double buffering
+    cudaEvent_t ghost_recv_ready[2];   // events to signal recv completion per buffer
+    cudaEvent_t send_ready[2];         // events to signal send buffer readiness per buffer
+    cudaEvent_t send_done[2];          // events to signal all outgoing copies reading send buffer are enqueued/completed
 
     int local_rows; // Number of rows owned by this GPU
     int local_nnz;  // Number of non-zero elements in local CSR partition
@@ -508,7 +511,6 @@ struct DeviceContext {
     double* h_pinned_h;
     size_t h_pinned_capacity;
     size_t h_pinned_stride;   // stride between h_first and h_corr (m_arnoldi+1)
-    cudaEvent_t send_ready;   // event to signal send buffer readiness
 
     // On/off-diagonal CSR storage
     int* d_row_ptr_on;
@@ -529,21 +531,27 @@ struct DeviceContext {
         d_row_ptr(nullptr), d_col_idx(nullptr), d_values(nullptr),
         matA_descr(nullptr), matA_on_descr(nullptr), matA_off_descr(nullptr),
         vec_v_descr(nullptr), vec_w_descr(nullptr), vec_y_descr(nullptr),
-        vec_q_local_descr(nullptr), vec_q_ghost_descr(nullptr),
+        vec_q_local_descr(nullptr),
         d_V_m(nullptr), d_q(nullptr), d_w(nullptr), d_y(nullptr),
-        d_ghost_send_buffer(nullptr),
         d_scalar_host_ptr(nullptr), d_scalar_device(nullptr), d_scalar_device_aux(nullptr),
         d_spmv_buffer(nullptr), spmv_buffer_size(0),
         h_pinned_h(nullptr), h_pinned_capacity(0), h_pinned_stride(0),
-        send_ready(nullptr),
         d_row_ptr_on(nullptr), d_col_idx_on(nullptr), d_values_on(nullptr),
         d_row_ptr_off(nullptr), d_col_idx_off(nullptr), d_values_off(nullptr),
         d_outgoing_global_col_indices(nullptr), d_incoming_global_col_indices(nullptr)
     {
         d_ghost_recv_buffer[0] = nullptr;
         d_ghost_recv_buffer[1] = nullptr;
+        d_ghost_send_buffer[0] = nullptr;
+        d_ghost_send_buffer[1] = nullptr;
         ghost_recv_ready[0] = nullptr;
         ghost_recv_ready[1] = nullptr;
+        send_ready[0] = nullptr;
+        send_ready[1] = nullptr;
+        send_done[0] = nullptr;
+        send_done[1] = nullptr;
+        vec_q_ghost_descr[0] = nullptr;
+        vec_q_ghost_descr[1] = nullptr;
     }
 
     // Initialize cuBLAS/cuSPARSE handles
@@ -568,7 +576,13 @@ struct DeviceContext {
         // Create events for ghost readiness (no timing to reduce overhead)
         CHECK_CUDA(cudaEventCreateWithFlags(&ghost_recv_ready[0], cudaEventDisableTiming));
         CHECK_CUDA(cudaEventCreateWithFlags(&ghost_recv_ready[1], cudaEventDisableTiming));
-        CHECK_CUDA(cudaEventCreateWithFlags(&send_ready, cudaEventDisableTiming));
+        CHECK_CUDA(cudaEventCreateWithFlags(&send_ready[0], cudaEventDisableTiming));
+        CHECK_CUDA(cudaEventCreateWithFlags(&send_ready[1], cudaEventDisableTiming));
+        CHECK_CUDA(cudaEventCreateWithFlags(&send_done[0], cudaEventDisableTiming));
+        CHECK_CUDA(cudaEventCreateWithFlags(&send_done[1], cudaEventDisableTiming));
+        // Initial record so first wait is safe/no-op
+        CHECK_CUDA(cudaEventRecord(send_done[0], stream_comm));
+        CHECK_CUDA(cudaEventRecord(send_done[1], stream_comm));
     }
 
     // Allocate device memory and copy CSR partition from host
@@ -717,7 +731,8 @@ struct DeviceContext {
         }
 
         if (ghost_map.total_send_size > 0) {
-            CHECK_CUDA(cudaMalloc(&d_ghost_send_buffer, sizeof(double) * ghost_map.total_send_size));
+            CHECK_CUDA(cudaMalloc(&d_ghost_send_buffer[0], sizeof(double) * ghost_map.total_send_size));
+            CHECK_CUDA(cudaMalloc(&d_ghost_send_buffer[1], sizeof(double) * ghost_map.total_send_size));
         }
 
         // Dense vector descriptors for BLAS/SpMV operations
@@ -725,9 +740,11 @@ struct DeviceContext {
         CHECK_CUSPARSE(cusparseCreateDnVec(&vec_y_descr, local_rows, d_y, CUDA_R_64F));
         CHECK_CUSPARSE(cusparseCreateDnVec(&vec_q_local_descr, local_rows, d_q, CUDA_R_64F));
         if (ghost_map.total_recv_size > 0) {
-            CHECK_CUSPARSE(cusparseCreateDnVec(&vec_q_ghost_descr, ghost_map.total_recv_size, d_ghost_recv_buffer[0], CUDA_R_64F));
+            CHECK_CUSPARSE(cusparseCreateDnVec(&vec_q_ghost_descr[0], ghost_map.total_recv_size, d_ghost_recv_buffer[0], CUDA_R_64F));
+            CHECK_CUSPARSE(cusparseCreateDnVec(&vec_q_ghost_descr[1], ghost_map.total_recv_size, d_ghost_recv_buffer[1], CUDA_R_64F));
         } else {
-            vec_q_ghost_descr = nullptr;
+            vec_q_ghost_descr[0] = nullptr;
+            vec_q_ghost_descr[1] = nullptr;
         }
 
         // Query and allocate buffer size for SpMV operations (use max of on/off)
@@ -740,9 +757,9 @@ struct DeviceContext {
                                                    CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &buf_on));
             spmv_buffer_size = std::max(spmv_buffer_size, buf_on);
         }
-        if (matA_off_descr && vec_q_ghost_descr) {
+        if (matA_off_descr && vec_q_ghost_descr[0]) {
             CHECK_CUSPARSE(cusparseSpMV_bufferSize(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                                   &alpha, matA_off_descr, vec_q_ghost_descr, &beta, vec_w_descr,
+                                                   &alpha, matA_off_descr, vec_q_ghost_descr[0], &beta, vec_w_descr,
                                                    CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &buf_off));
             spmv_buffer_size = std::max(spmv_buffer_size, buf_off);
         }
@@ -780,7 +797,8 @@ struct DeviceContext {
         if (vec_w_descr) CHECK_CUSPARSE(cusparseDestroyDnVec(vec_w_descr));
         if (vec_y_descr) CHECK_CUSPARSE(cusparseDestroyDnVec(vec_y_descr));
         if (vec_q_local_descr) CHECK_CUSPARSE(cusparseDestroyDnVec(vec_q_local_descr));
-        if (vec_q_ghost_descr) CHECK_CUSPARSE(cusparseDestroyDnVec(vec_q_ghost_descr));
+        if (vec_q_ghost_descr[0]) CHECK_CUSPARSE(cusparseDestroyDnVec(vec_q_ghost_descr[0]));
+        if (vec_q_ghost_descr[1]) CHECK_CUSPARSE(cusparseDestroyDnVec(vec_q_ghost_descr[1]));
 
         if (d_row_ptr) CHECK_CUDA(cudaFree(d_row_ptr));
         if (d_col_idx) CHECK_CUDA(cudaFree(d_col_idx));
@@ -800,7 +818,8 @@ struct DeviceContext {
 
         if (d_ghost_recv_buffer[0]) CHECK_CUDA(cudaFree(d_ghost_recv_buffer[0]));
         if (d_ghost_recv_buffer[1]) CHECK_CUDA(cudaFree(d_ghost_recv_buffer[1]));
-        if (d_ghost_send_buffer) CHECK_CUDA(cudaFree(d_ghost_send_buffer));
+        if (d_ghost_send_buffer[0]) CHECK_CUDA(cudaFree(d_ghost_send_buffer[0]));
+        if (d_ghost_send_buffer[1]) CHECK_CUDA(cudaFree(d_ghost_send_buffer[1]));
         if (d_outgoing_global_col_indices) CHECK_CUDA(cudaFree(d_outgoing_global_col_indices));
         if (d_incoming_global_col_indices) CHECK_CUDA(cudaFree(d_incoming_global_col_indices));
 
@@ -814,7 +833,10 @@ struct DeviceContext {
         if (stream_reduce) CHECK_CUDA(cudaStreamDestroy(stream_reduce));
         if (ghost_recv_ready[0]) CHECK_CUDA(cudaEventDestroy(ghost_recv_ready[0]));
         if (ghost_recv_ready[1]) CHECK_CUDA(cudaEventDestroy(ghost_recv_ready[1]));
-        if (send_ready) CHECK_CUDA(cudaEventDestroy(send_ready));
+        if (send_ready[0]) CHECK_CUDA(cudaEventDestroy(send_ready[0]));
+        if (send_ready[1]) CHECK_CUDA(cudaEventDestroy(send_ready[1]));
+        if (send_done[0]) CHECK_CUDA(cudaEventDestroy(send_done[0]));
+        if (send_done[1]) CHECK_CUDA(cudaEventDestroy(send_done[1]));
 
         if (h_pinned_h) CHECK_CUDA(cudaFreeHost(h_pinned_h));
     }
@@ -1251,58 +1273,89 @@ struct ArnoldiRunner {
     }
 
     void ghost_exchange_qj(int j) {
+        int buf_idx = j % 2;
 
-        // Phase 1: owners gather into send buffers in their own comm stream
+        // (A) Owners: wait for previous use of this send buffer, then gather q_j
         for (int owner = 0; owner < num_gpus; ++owner) {
             CHECK_CUDA(cudaSetDevice(device_contexts[owner].device_id));
             DeviceContext& dc_owner = device_contexts[owner];
             CSRHost::GhostMap& gm_owner = ghost_maps[owner];
 
-            if (gm_owner.outgoing_global_col_indices.empty()) continue;
+            if (gm_owner.outgoing_global_col_indices.empty()) {
+                continue;
+            }
+
+            // Ensure prior consumers finished reading this buffer before overwrite
+            CHECK_CUDA(cudaStreamWaitEvent(dc_owner.stream_comm, dc_owner.send_done[buf_idx], 0));
 
             double* d_qj_local = dc_owner.d_V_m + j * dc_owner.local_rows;
-            int blocks = (gm_owner.outgoing_global_col_indices.size() + 255) / 256;
+            int n_send = static_cast<int>(gm_owner.outgoing_global_col_indices.size());
+            int blocks = (n_send + 255) / 256;
             gather_q_elements_for_send_kernel<<<blocks, 256, 0, dc_owner.stream_comm>>>(
                 d_qj_local,
                 dc_owner.d_outgoing_global_col_indices,
-                dc_owner.d_ghost_send_buffer,
-                static_cast<int>(gm_owner.outgoing_global_col_indices.size()),
+                dc_owner.d_ghost_send_buffer[buf_idx],
+                n_send,
                 get_global_row_offset(owner));
             CHECK_CUDA(cudaGetLastError());
-            // Ensure gather finished before scheduling copies
-            CHECK_CUDA(cudaEventRecord(dc_owner.send_ready, dc_owner.stream_comm));
+            CHECK_CUDA(cudaEventRecord(dc_owner.send_ready[buf_idx], dc_owner.stream_comm));
         }
 
-        // Phase 2: enqueue all memcpy to each consumer, then one event per consumer buffer
+        // (B) Owners: enqueue outgoing copies on owner stream, then mark send_done
+        for (int owner = 0; owner < num_gpus; ++owner) {
+            CHECK_CUDA(cudaSetDevice(device_contexts[owner].device_id));
+            DeviceContext& dc_owner = device_contexts[owner];
+            CSRHost::GhostMap& gm_owner = ghost_maps[owner];
+
+            if (!gm_owner.outgoing_peer_info.empty()) {
+                CHECK_CUDA(cudaStreamWaitEvent(dc_owner.stream_comm, dc_owner.send_ready[buf_idx], 0));
+
+                for (auto const& [consumer, out_info] : gm_owner.outgoing_peer_info) {
+                    size_t send_offset = out_info.first;
+                    size_t count = out_info.second;
+                    if (count == 0) continue;
+
+                    CSRHost::GhostMap& gm_consumer = ghost_maps[consumer];
+                    auto in_it = gm_consumer.incoming_peer_info.find(owner);
+                    if (in_it == gm_consumer.incoming_peer_info.end()) {
+                        fprintf(stderr, "Ghost plan mismatch: owner %d missing incoming_peer_info on consumer %d\n", owner, consumer);
+                        exit(EXIT_FAILURE);
+                    }
+                    size_t recv_offset = in_it->second.first;
+                    size_t recv_count  = in_it->second.second;
+                    if (recv_count != count) {
+                        fprintf(stderr, "Ghost plan mismatch: owner %d -> consumer %d count send=%zu recv=%zu\n",
+                                owner, consumer, count, recv_count);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    DeviceContext& dc_consumer = device_contexts[consumer];
+
+                    CHECK_CUDA(cudaMemcpyPeerAsync(
+                        dc_consumer.d_ghost_recv_buffer[buf_idx] + recv_offset, dc_consumer.device_id,
+                        dc_owner.d_ghost_send_buffer[buf_idx] + send_offset,  dc_owner.device_id,
+                        sizeof(double) * count,
+                        dc_owner.stream_comm));
+                }
+            }
+            // Signal that this send buffer is free to reuse after all enqueued copies
+            CHECK_CUDA(cudaEventRecord(dc_owner.send_done[buf_idx], dc_owner.stream_comm));
+        }
+
+        // (C) Consumers: wait for all relevant owners' send_done, then mark recv_ready
         for (int consumer = 0; consumer < num_gpus; ++consumer) {
             CHECK_CUDA(cudaSetDevice(device_contexts[consumer].device_id));
             DeviceContext& dc_consumer = device_contexts[consumer];
             CSRHost::GhostMap& gm_consumer = ghost_maps[consumer];
-            int buf_idx = j % 2;
-            double* recv_buf = dc_consumer.d_ghost_recv_buffer[buf_idx];
 
-            for (auto const& [owner_id, peer_info] : gm_consumer.incoming_peer_info) {
-                size_t recv_offset = peer_info.first;
-                size_t count = peer_info.second;
+            for (auto const& [owner, in_info] : gm_consumer.incoming_peer_info) {
+                size_t count = in_info.second;
                 if (count == 0) continue;
-
-                CSRHost::GhostMap& gm_owner = ghost_maps[owner_id];
-                auto out_it = gm_owner.outgoing_peer_info.find(consumer);
-                if (out_it == gm_owner.outgoing_peer_info.end()) continue;
-                size_t send_offset = out_it->second.first;
-
-                DeviceContext& dc_owner = device_contexts[owner_id];
-                // Copies enqueued in consumer stream
-                CHECK_CUDA(cudaStreamWaitEvent(dc_consumer.stream_comm, dc_owner.send_ready, 0));
-                CHECK_CUDA(cudaMemcpyPeerAsync(recv_buf + recv_offset, dc_consumer.device_id,
-                                               dc_owner.d_ghost_send_buffer + send_offset, dc_owner.device_id,
-                                               sizeof(double) * count, dc_consumer.stream_comm));
+                DeviceContext& dc_owner = device_contexts[owner];
+                CHECK_CUDA(cudaStreamWaitEvent(dc_consumer.stream_comm, dc_owner.send_done[buf_idx], 0));
             }
 
-            // Always record a completion event (even if no copies) for this buffer
-            if (dc_consumer.ghost_recv_ready[buf_idx]) {
-                CHECK_CUDA(cudaEventRecord(dc_consumer.ghost_recv_ready[buf_idx], dc_consumer.stream_comm));
-            }
+            CHECK_CUDA(cudaEventRecord(dc_consumer.ghost_recv_ready[buf_idx], dc_consumer.stream_comm));
         }
     }
 
@@ -1338,11 +1391,10 @@ struct ArnoldiRunner {
 
             int current_recv_buffer_idx = j % 2;
             CHECK_CUDA(cudaStreamWaitEvent(dc.stream_compute, dc.ghost_recv_ready[current_recv_buffer_idx], 0));
-            CHECK_CUSPARSE(cusparseDnVecSetValues(dc.vec_q_ghost_descr, dc.d_ghost_recv_buffer[current_recv_buffer_idx]));
 
             const double alpha = 1.0, beta = 1.0; // accumulate into existing w
             CHECK_CUSPARSE(cusparseSpMV(dc.cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                       &alpha, dc.matA_off_descr, dc.vec_q_ghost_descr, &beta, dc.vec_w_descr,
+                                       &alpha, dc.matA_off_descr, dc.vec_q_ghost_descr[current_recv_buffer_idx], &beta, dc.vec_w_descr,
                                        CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_spmv_buffer));
         }
     }
@@ -1595,7 +1647,7 @@ struct ArnoldiRunner {
         double e_k_exp_tH_e1 = exp_tH_e1(k_used - 1);
 
         double h_k_plus_1_k = H_m(k_used, k_used - 1);
-        double residual_norm = std::abs(h_k_plus_1_k * e_k_exp_tH_e1);
+        double residual_norm = std::abs(h_k_plus_1_k * e_k_exp_tH_e1) * v_norm;
 
         return residual_norm;
     }
