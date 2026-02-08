@@ -34,6 +34,10 @@ for d in LOG_ROOT RUNTIME_LOG_DIR NSYS_DIR NCU_DIR; do
     eval "$d=\"$PROJECT_ROOT/$val\""
   fi
 done
+# Make OUTPUT_Y_FILE absolute if provided
+if [[ -n "${OUTPUT_Y_FILE-}" && "$OUTPUT_Y_FILE" != /* ]]; then
+  OUTPUT_Y_FILE="$PROJECT_ROOT/$OUTPUT_Y_FILE"
+fi
 
 # Parse arguments
 # If first argument starts with '--', use named arguments
@@ -153,6 +157,10 @@ cat > "$TEMP_SLURM" << EOF
 #SBATCH --time=$TIME
 #SBATCH --output=${RUNTIME_LOG_DIR}/matrix_exp_%j.out
 #SBATCH --error=${RUNTIME_LOG_DIR}/matrix_exp_%j.err
+#SBATCH --export=ALL
+
+# Propagate OUTPUT_Y_FILE explicitly (if set at submission)
+export OUTPUT_Y_FILE="${OUTPUT_Y_FILE:-}"
 
 echo "=== Matrix Exponential SLURM Job ==="
 echo "Job ID: \$SLURM_JOB_ID"
