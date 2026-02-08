@@ -878,6 +878,35 @@ __global__ void reciprocal_scalar_kernel(double* val) {
     }
 }
 
+// Simple CSR SpMV kernels (row-parallel)
+__global__ void spmv_csr_on_kernel(const int* row_ptr, const int* col_idx, const double* vals,
+                                   const double* x, double* y, int rows) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) {
+        double acc = 0.0;
+        int start = row_ptr[r];
+        int end = row_ptr[r + 1];
+        for (int k = start; k < end; ++k) {
+            acc += vals[k] * x[col_idx[k]];
+        }
+        y[r] = acc;
+    }
+}
+
+__global__ void spmv_csr_off_kernel(const int* row_ptr, const int* col_idx, const double* vals,
+                                    const double* x_ghost, double* y, int rows) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) {
+        double acc = 0.0;
+        int start = row_ptr[r];
+        int end = row_ptr[r + 1];
+        for (int k = start; k < end; ++k) {
+            acc += vals[k] * x_ghost[col_idx[k]];
+        }
+        y[r] += acc; // accumulate into y
+    }
+}
+
 // NcclContext class for NCCL communication
 struct NcclContext {
     std::vector<ncclComm_t> comms;
@@ -1369,17 +1398,17 @@ struct ArnoldiRunner {
             DeviceContext& dc = device_contexts[i];
 
             double* d_qj_local = dc.d_V_m + j * dc.local_rows;
-            CHECK_CUSPARSE(cusparseDnVecSetValues(dc.vec_q_local_descr, d_qj_local));
 
             // Zero out d_w before accumulation
             CHECK_CUDA(cudaMemsetAsync(dc.d_w, 0, sizeof(double) * dc.local_rows, dc.stream_compute));
 
-            if (dc.matA_on_descr) {
-                const double alpha = 1.0, beta = 0.0;
-                CHECK_CUSPARSE(cusparseSpMV(dc.cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                           &alpha, dc.matA_on_descr, dc.vec_q_local_descr, &beta, dc.vec_w_descr,
-                                           CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_spmv_buffer));
-            }
+            // Custom CSR on-diag SpMV
+            int threads = 256;
+            int blocks = (dc.local_rows + threads - 1) / threads;
+            spmv_csr_on_kernel<<<blocks, threads, 0, dc.stream_compute>>>(
+                dc.d_row_ptr_on, dc.d_col_idx_on, dc.d_values_on,
+                d_qj_local, dc.d_w, dc.local_rows);
+            CHECK_CUDA(cudaGetLastError());
         }
 
         // Phase 2: Off-diag SpMV using ghost buffer, accumulate into w
@@ -1387,15 +1416,19 @@ struct ArnoldiRunner {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             CSRHost::GhostMap& gm = ghost_maps[i];
-            if (!dc.matA_off_descr || gm.total_recv_size == 0) continue;
+            if (!dc.d_row_ptr_off || gm.total_recv_size == 0) continue;
 
             int current_recv_buffer_idx = j % 2;
             CHECK_CUDA(cudaStreamWaitEvent(dc.stream_compute, dc.ghost_recv_ready[current_recv_buffer_idx], 0));
 
-            const double alpha = 1.0, beta = 1.0; // accumulate into existing w
-            CHECK_CUSPARSE(cusparseSpMV(dc.cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                       &alpha, dc.matA_off_descr, dc.vec_q_ghost_descr[current_recv_buffer_idx], &beta, dc.vec_w_descr,
-                                       CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_spmv_buffer));
+            // Custom CSR off-diag SpMV accumulate into w
+            int threads = 256;
+            int blocks = (dc.local_rows + threads - 1) / threads;
+            spmv_csr_off_kernel<<<blocks, threads, 0, dc.stream_compute>>>(
+                dc.d_row_ptr_off, dc.d_col_idx_off, dc.d_values_off,
+                dc.d_ghost_recv_buffer[current_recv_buffer_idx],
+                dc.d_w, dc.local_rows);
+            CHECK_CUDA(cudaGetLastError());
         }
     }
 
