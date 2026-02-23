@@ -12,6 +12,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 
 // CUDA includes
 #include <cuda_runtime.h>
@@ -237,6 +240,284 @@ struct CSRHost {
         while (current_row < rows) {
             row_ptr[current_row + 1] = static_cast<int>(col_idx.size());
             current_row++;
+        }
+    }
+
+    static uint32_t load_le_u32(const unsigned char* p) {
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    }
+
+    static uint64_t load_le_u64(const unsigned char* p) {
+        return static_cast<uint64_t>(p[0]) |
+               (static_cast<uint64_t>(p[1]) << 8) |
+               (static_cast<uint64_t>(p[2]) << 16) |
+               (static_cast<uint64_t>(p[3]) << 24) |
+               (static_cast<uint64_t>(p[4]) << 32) |
+               (static_cast<uint64_t>(p[5]) << 40) |
+               (static_cast<uint64_t>(p[6]) << 48) |
+               (static_cast<uint64_t>(p[7]) << 56);
+    }
+
+    void from_binary_csr(const std::string& filename) {
+        std::ifstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not open binary CSR file " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        file.seekg(0, std::ios::end);
+        const std::streamoff file_size = file.tellg();
+        file.seekg(0, std::ios::beg);
+        if (file_size < 64) {
+            std::cerr << "Error: Binary CSR file too small (expected at least 64 bytes): " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        unsigned char header[64];
+        file.read(reinterpret_cast<char*>(header), 64);
+        if (!file) {
+            std::cerr << "Error: Failed to read 64-byte header from " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        const unsigned char expected_magic[8] = {'C', 'S', 'R', 0, 0, 0, 0, 1};
+        if (std::memcmp(header + 0, expected_magic, 8) != 0) {
+            std::cerr << "Error: Invalid Binary CSR magic in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        const uint32_t version = load_le_u32(header + 8);
+        const uint32_t flags = load_le_u32(header + 12);
+        const uint64_t nrows_u64 = load_le_u64(header + 16);
+        const uint64_t ncols_u64 = load_le_u64(header + 24);
+        const uint64_t nnz_u64 = load_le_u64(header + 32);
+        const uint32_t index_dtype = load_le_u32(header + 40); // 1=u32, 2=u64
+        const uint32_t value_dtype = load_le_u32(header + 44); // 1=f32, 2=f64
+        const uint64_t reserved0 = load_le_u64(header + 48);
+        const uint64_t reserved1 = load_le_u64(header + 56);
+
+        if (version != 1) {
+            std::cerr << "Error: Unsupported Binary CSR version " << version << " in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (!(index_dtype == 1 || index_dtype == 2)) {
+            std::cerr << "Error: Unsupported index_dtype=" << index_dtype << " in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (!(value_dtype == 1 || value_dtype == 2)) {
+            std::cerr << "Error: Unsupported value_dtype=" << value_dtype << " in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (reserved0 != 0 || reserved1 != 0) {
+            std::cerr << "Error: Reserved header fields must be zero in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (nrows_u64 > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+            ncols_u64 > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+            nnz_u64 > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            std::cerr << "Error: Matrix dimensions/nnz exceed int32 limits used by solver in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        const size_t index_bytes = (index_dtype == 1) ? sizeof(uint32_t) : sizeof(uint64_t);
+        const size_t value_bytes = (value_dtype == 1) ? sizeof(float) : sizeof(double);
+        const uint64_t indptr_len = nrows_u64 + 1;
+
+        uint64_t expected_payload = 0;
+        expected_payload += indptr_len * static_cast<uint64_t>(index_bytes);
+        expected_payload += nnz_u64 * static_cast<uint64_t>(index_bytes);
+        expected_payload += nnz_u64 * static_cast<uint64_t>(value_bytes);
+        const uint64_t expected_total = 64 + expected_payload;
+        if (expected_total != static_cast<uint64_t>(file_size)) {
+            std::cerr << "Error: Binary CSR size mismatch in " << filename
+                      << " (expected " << expected_total << " bytes, got " << file_size << ")" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        std::vector<uint64_t> indptr64(indptr_len, 0);
+        std::vector<uint64_t> indices64(nnz_u64, 0);
+        std::vector<double> data64(nnz_u64, 0.0);
+
+        if (index_dtype == 1) {
+            std::vector<uint32_t> tmp(indptr_len);
+            file.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(tmp.size() * sizeof(uint32_t)));
+            if (!file) {
+                std::cerr << "Error: Failed to read indptr(u32) from " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            for (size_t i = 0; i < tmp.size(); ++i) indptr64[i] = static_cast<uint64_t>(tmp[i]);
+
+            std::vector<uint32_t> tmp_idx(nnz_u64);
+            file.read(reinterpret_cast<char*>(tmp_idx.data()), static_cast<std::streamsize>(tmp_idx.size() * sizeof(uint32_t)));
+            if (!file) {
+                std::cerr << "Error: Failed to read indices(u32) from " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            for (size_t i = 0; i < tmp_idx.size(); ++i) indices64[i] = static_cast<uint64_t>(tmp_idx[i]);
+        } else {
+            file.read(reinterpret_cast<char*>(indptr64.data()), static_cast<std::streamsize>(indptr64.size() * sizeof(uint64_t)));
+            if (!file) {
+                std::cerr << "Error: Failed to read indptr(u64) from " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            file.read(reinterpret_cast<char*>(indices64.data()), static_cast<std::streamsize>(indices64.size() * sizeof(uint64_t)));
+            if (!file) {
+                std::cerr << "Error: Failed to read indices(u64) from " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        if (value_dtype == 1) {
+            std::vector<float> tmp_val(nnz_u64);
+            file.read(reinterpret_cast<char*>(tmp_val.data()), static_cast<std::streamsize>(tmp_val.size() * sizeof(float)));
+            if (!file) {
+                std::cerr << "Error: Failed to read data(f32) from " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            for (size_t i = 0; i < tmp_val.size(); ++i) data64[i] = static_cast<double>(tmp_val[i]);
+        } else {
+            file.read(reinterpret_cast<char*>(data64.data()), static_cast<std::streamsize>(data64.size() * sizeof(double)));
+            if (!file) {
+                std::cerr << "Error: Failed to read data(f64) from " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        rows = static_cast<int>(nrows_u64);
+        cols = static_cast<int>(ncols_u64);
+        nnz = static_cast<long long>(nnz_u64);
+
+        if (indptr64.size() != static_cast<size_t>(rows + 1)) {
+            std::cerr << "Error: indptr length mismatch in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (indptr64[0] != 0) {
+            std::cerr << "Error: indptr[0] must be 0 in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        for (int r = 0; r < rows; ++r) {
+            if (indptr64[r] > indptr64[r + 1]) {
+                std::cerr << "Error: indptr is not non-decreasing at row " << r << " in " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (indptr64[rows] != nnz_u64) {
+            std::cerr << "Error: indptr[nrows] != nnz in " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        for (uint64_t k = 0; k < nnz_u64; ++k) {
+            if (indices64[k] >= ncols_u64) {
+                std::cerr << "Error: Column index out of range at k=" << k << " in " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        const bool flag_sorted = (flags & (1u << 0)) != 0;
+        const bool flag_no_dup = (flags & (1u << 1)) != 0;
+        const bool flag_symmetric_upper = (flags & (1u << 2)) != 0;
+
+        std::cout << "Binary CSR header: "
+                  << "version=" << version
+                  << " flags=0x" << std::hex << flags << std::dec
+                  << " index_dtype=" << (index_dtype == 1 ? "u32" : "u64")
+                  << " value_dtype=" << (value_dtype == 1 ? "f32" : "f64")
+                  << " symmetric_upper=" << (flag_symmetric_upper ? "yes" : "no")
+                  << std::endl;
+
+        if (flag_sorted || flag_no_dup) {
+            for (int r = 0; r < rows; ++r) {
+                uint64_t start = indptr64[r];
+                uint64_t end = indptr64[r + 1];
+                for (uint64_t p = start + 1; p < end; ++p) {
+                    if (flag_sorted && indices64[p - 1] > indices64[p]) {
+                        std::cerr << "Error: Row " << r << " is not sorted but sorted flag is set in " << filename << std::endl;
+                        exit(EXIT_FAILURE);
+                    }
+                    if (flag_no_dup && indices64[p - 1] == indices64[p]) {
+                        std::cerr << "Error: Row " << r << " has duplicates but no_duplicates flag is set in " << filename << std::endl;
+                        exit(EXIT_FAILURE);
+                    }
+                }
+            }
+        }
+
+        if (flag_symmetric_upper) {
+            if (rows != cols) {
+                std::cerr << "Error: symmetric_upper requires square matrix in " << filename << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            std::vector<std::tuple<int, int, double>> entries;
+            entries.reserve(static_cast<size_t>(nnz_u64) * 2);
+            for (int r = 0; r < rows; ++r) {
+                uint64_t start = indptr64[r];
+                uint64_t end = indptr64[r + 1];
+                for (uint64_t p = start; p < end; ++p) {
+                    int c = static_cast<int>(indices64[p]);
+                    double v = data64[p];
+                    entries.emplace_back(r, c, v);
+                    if (c != r) {
+                        entries.emplace_back(c, r, v);
+                    }
+                }
+            }
+
+            std::sort(entries.begin(), entries.end());
+
+            std::vector<std::tuple<int, int, double>> merged;
+            merged.reserve(entries.size());
+            for (const auto& e : entries) {
+                if (merged.empty() || std::get<0>(merged.back()) != std::get<0>(e) || std::get<1>(merged.back()) != std::get<1>(e)) {
+                    merged.push_back(e);
+                } else {
+                    std::get<2>(merged.back()) += std::get<2>(e);
+                }
+            }
+
+            row_ptr.assign(rows + 1, 0);
+            col_idx.clear();
+            values.clear();
+            col_idx.reserve(merged.size());
+            values.reserve(merged.size());
+
+            int current_row = 0;
+            for (const auto& entry : merged) {
+                int r, c;
+                double v;
+                std::tie(r, c, v) = entry;
+                while (current_row < r) {
+                    row_ptr[current_row + 1] = static_cast<int>(col_idx.size());
+                    current_row++;
+                }
+                col_idx.push_back(c);
+                values.push_back(v);
+            }
+            while (current_row < rows) {
+                row_ptr[current_row + 1] = static_cast<int>(col_idx.size());
+                current_row++;
+            }
+            nnz = static_cast<long long>(values.size());
+        } else {
+            row_ptr.resize(rows + 1);
+            col_idx.resize(nnz_u64);
+            values.resize(nnz_u64);
+            for (int r = 0; r <= rows; ++r) {
+                if (indptr64[r] > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                    std::cerr << "Error: indptr value exceeds int32 at row " << r << " in " << filename << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+                row_ptr[r] = static_cast<int>(indptr64[r]);
+            }
+            for (uint64_t k = 0; k < nnz_u64; ++k) {
+                if (indices64[k] > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                    std::cerr << "Error: index value exceeds int32 at k=" << k << " in " << filename << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+                col_idx[k] = static_cast<int>(indices64[k]);
+                values[k] = data64[k];
+            }
         }
     }
 
@@ -1820,11 +2101,43 @@ int main(int argc, char* argv[]) {
         // Use available GPUs (limit to 4 for this example)
         int num_gpus_to_use = std::min(num_gpus, 4);
 
+        auto ends_with = [](const std::string& s, const std::string& suffix) -> bool {
+            return s.size() >= suffix.size() &&
+                   s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        auto has_bincsr_magic = [](const std::string& path) -> bool {
+            std::ifstream f(path, std::ios::binary);
+            if (!f.is_open()) return false;
+            unsigned char hdr[8] = {0};
+            f.read(reinterpret_cast<char*>(hdr), 8);
+            if (!f || f.gcount() != 8) return false;
+            const unsigned char magic[8] = {'C', 'S', 'R', 0, 0, 0, 0, 1};
+            return std::memcmp(hdr, magic, 8) == 0;
+        };
+
         // Prepare matrix
         CSRHost test_matrix;
         if (use_file) {
             std::cout << "Loading matrix from file: " << matrix_file << std::endl;
-            test_matrix.from_matrix_market(matrix_file);
+            const bool is_bincsr_ext = ends_with(matrix_file, ".bincsr");
+            const bool is_mtx_ext = ends_with(matrix_file, ".mtx") || ends_with(matrix_file, ".mtx.gz");
+            bool loaded = false;
+
+            if (is_bincsr_ext || has_bincsr_magic(matrix_file)) {
+                test_matrix.from_binary_csr(matrix_file);
+                loaded = true;
+                std::cout << "Detected Binary CSR v1 input" << std::endl;
+            } else if (is_mtx_ext) {
+                test_matrix.from_matrix_market(matrix_file);
+                loaded = true;
+                std::cout << "Detected MatrixMarket input" << std::endl;
+            }
+
+            if (!loaded) {
+                std::cerr << "Error: Could not detect matrix format for file " << matrix_file
+                          << ". Supported: .bincsr, .mtx, .mtx.gz" << std::endl;
+                return EXIT_FAILURE;
+            }
             std::cout << "Loaded matrix: " << test_matrix.rows << "x" << test_matrix.cols
                       << " with " << test_matrix.nnz << " non-zeros" << std::endl;
         } else {
