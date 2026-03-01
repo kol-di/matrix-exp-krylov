@@ -9,7 +9,9 @@
 #   ./launch.sh                    # defaults: 2 GPU, 5 min, size 1000
 #   ./launch.sh 4 00:10:00 2000    # 4 GPU, 10 min, size 2000 (positional)
 #   ./launch.sh matrices/A.mtx     # load matrix file (defaults for gpus/time)
+#   ./launch.sh matrices/A.bincsr  # load Binary CSR v1 file
 #   ./launch.sh --matrix matrices/A.mtx --gpus 4 --time 00:15:00
+#   ./launch.sh --matrix matrices/A.bincsr --gpus 4 --time 00:15:00
 #   ./launch.sh --size 500         # size 500, other params default
 #   ./launch.sh --size 2000 --gpus 4 --time 00:15:00
 
@@ -159,8 +161,12 @@ cat > "$TEMP_SLURM" << EOF
 #SBATCH --error=${RUNTIME_LOG_DIR}/matrix_exp_%j.err
 #SBATCH --export=ALL
 
-# Propagate OUTPUT_Y_FILE explicitly (if set at submission)
-export OUTPUT_Y_FILE="${OUTPUT_Y_FILE:-}"
+# Propagate OUTPUT_Y_FILE only when non-empty
+if [[ -n "${OUTPUT_Y_FILE-}" ]]; then
+  export OUTPUT_Y_FILE
+else
+  unset OUTPUT_Y_FILE
+fi
 
 echo "=== Matrix Exponential SLURM Job ==="
 echo "Job ID: \$SLURM_JOB_ID"
@@ -211,7 +217,9 @@ echo "Matrix size: $SIZE"
 fi
 echo ""
 
-# Prepare matrix file if provided
+# Prepare matrix file if provided.
+# For MatrixMarket .gz, decompress to a temporary .mtx.
+# For Binary CSR (.bincsr), pass through as-is.
 ACTUAL_ARG="$RUN_ARG"
 TEMP_MATRIX=""
 if [[ -n "$MATRIX_FILE" ]]; then
@@ -248,17 +256,32 @@ if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
 fi
 
 if [[ "$PROFILER" == "nsys" ]]; then
-    # Check nsys
-    if ! command -v nsys &> /dev/null; then
+    # Prefer newer Nsight Systems from NVIDIA HPC SDK, fallback to module-provided nsys.
+    NSYS_BIN=""
+    for cand in \
+        /opt/software/nvidia/hpc_sdk/v24.11/Linux_x86_64/24.11/profilers/Nsight_Systems/bin/nsys \
+        /opt/software/nvidia/hpc_sdk/v24.11/Linux_x86_64/2024/profilers/Nsight_Systems/bin/nsys \
+        /opt/software/nvidia/hpc_sdk/v24.5/Linux_x86_64/24.5/profilers/Nsight_Systems/bin/nsys \
+        /opt/software/nvidia/hpc_sdk/v24.5/Linux_x86_64/2024/profilers/Nsight_Systems/bin/nsys; do
+        if [[ -x "\$cand" ]]; then
+            NSYS_BIN="\$cand"
+            break
+        fi
+    done
+    if [[ -z "\$NSYS_BIN" ]]; then
+        NSYS_BIN="\$(command -v nsys || true)"
+    fi
+    if [[ -z "\$NSYS_BIN" ]]; then
         echo "ERROR: nsys not found. Make sure CUDA module is loaded."
         exit 1
     fi
     echo "Nsight Systems version:"
-    nsys --version
+    "\$NSYS_BIN" --version
     echo ""
     PROFILE_OUTPUT="${NSYS_DIR}/matrix_exp_profile_\${SLURM_JOB_ID}"
     echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
-    nsys profile \\
+    # Keep trace minimal to reduce importer instability on some stacks.
+    "\$NSYS_BIN" profile \\
         --output="\$PROFILE_OUTPUT" \\
         --force-overwrite=true \\
         --trace=cuda,nvtx,cublas,osrt \\
@@ -266,6 +289,11 @@ if [[ "$PROFILER" == "nsys" ]]; then
         --cuda-memory-usage=true \\
         ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
     PROFILE_EXIT_CODE=\$?
+    # Treat missing report as a profiler failure even when nsys returns 0.
+    if [[ \$PROFILE_EXIT_CODE -eq 0 && ! -f "\${PROFILE_OUTPUT}.nsys-rep" ]]; then
+        echo "ERROR: nsys finished but did not produce \${PROFILE_OUTPUT}.nsys-rep"
+        PROFILE_EXIT_CODE=2
+    fi
 elif [[ "$PROFILER" == "ncu" ]]; then
     # Check ncu
     if ! command -v ncu &> /dev/null; then
@@ -295,10 +323,10 @@ fi
 if [ \$PROFILE_EXIT_CODE -eq 0 ]; then
     echo ""
     echo "=== Job completed successfully ==="
-    if [ -f "\$PROFILE_OUTPUT" ]; then
-        echo "Profile report saved: \$PROFILE_OUTPUT"
-        echo "To view the report, use: nsys-ui \$PROFILE_OUTPUT"
-        echo "Or generate a report: nsys stats \$PROFILE_OUTPUT"
+    if [ -f "\${PROFILE_OUTPUT}.nsys-rep" ]; then
+        echo "Profile report saved: \${PROFILE_OUTPUT}.nsys-rep"
+        echo "To view the report, use: nsys-ui \${PROFILE_OUTPUT}.nsys-rep"
+        echo "Or generate a report: nsys stats \${PROFILE_OUTPUT}.nsys-rep"
     fi
 else
     echo ""
@@ -306,6 +334,7 @@ else
 fi
 
 echo "End time: \$(date)"
+exit \$PROFILE_EXIT_CODE
 EOF
 
 # Submit the job

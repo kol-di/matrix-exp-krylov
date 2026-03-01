@@ -2230,8 +2230,8 @@ int main(int argc, char* argv[]) {
         // Compute exp(tA)v
         runner.compute_expmv(v_host, y_host);
 
-        // Optional: dump full y_host to a file if OUTPUT_Y_FILE is set
-        if (const char* out_path = std::getenv("OUTPUT_Y_FILE")) {
+        // Optional: dump full y_host to a file if OUTPUT_Y_FILE is set and non-empty
+        if (const char* out_path = std::getenv("OUTPUT_Y_FILE"); out_path && out_path[0] != '\0') {
             std::ofstream ofs(out_path);
             if (!ofs) {
                 std::cerr << "Error: could not open OUTPUT_Y_FILE=" << out_path << " for writing" << std::endl;
