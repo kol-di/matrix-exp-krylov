@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <chrono>
 
 // CUDA includes
 #include <cuda_runtime.h>
@@ -1365,6 +1366,7 @@ struct ArnoldiRunner {
     }
 
     void compute_expmv(const std::vector<double>& v_host, std::vector<double>& y_host) {
+        auto total_compute_start = std::chrono::steady_clock::now();
         NvtxRange total_range("total_compute_expmv");
         // Full procedure: normalize q1 -> Arnoldi restarts -> small exponentiation -> lift -> restart/finish
         // Details will be filled in subsequent steps.
@@ -1518,6 +1520,11 @@ struct ArnoldiRunner {
         std::cout << "[FLOPs] CPU segment: " << flops_cpu_segment
                   << " | CPU total: " << flops_cpu_total
                   << " (C_exp=" << C_EXP_FLOP_FACTOR << ")" << std::endl;
+
+        auto total_compute_end = std::chrono::steady_clock::now();
+        double total_compute_ms =
+            std::chrono::duration<double, std::milli>(total_compute_end - total_compute_start).count();
+        std::cout << "METRIC total_compute_expmv_ms=" << total_compute_ms << std::endl;
     }
 
     // Internal methods (details to be implemented)
