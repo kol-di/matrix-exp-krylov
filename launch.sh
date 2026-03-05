@@ -28,6 +28,7 @@ NCU_DIR="$LOG_ROOT/ncu_profiles"
 M_PARAM=""
 T_PARAM=""
 MAX_RESTARTS_PARAM=""
+CONSTRAINT_PARAM=""
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 # Resolve paths relative to project root (so they don't end up under build/)
 for d in LOG_ROOT RUNTIME_LOG_DIR NSYS_DIR NCU_DIR; do
@@ -78,11 +79,15 @@ if [[ $# -gt 0 && "$1" == --* ]]; then
                 PROFILER="$2"
                 shift 2
                 ;;
+            --constraint)
+                CONSTRAINT_PARAM="$2"
+                shift 2
+                ;;
             *)
                 echo "Unknown option: $1"
                 echo "Usage: ./launch.sh [gpus] [time] [size|matrix_file]"
-                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none]"
-                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none]"
+                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--constraint EXPR]"
+                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--constraint EXPR]"
                 exit 1
                 ;;
         esac
@@ -141,10 +146,18 @@ fi
 if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
     echo "  Max restarts: $MAX_RESTARTS_PARAM (<=0 means until convergence)"
 fi
+if [[ -n "$CONSTRAINT_PARAM" ]]; then
+    echo "  Constraint: $CONSTRAINT_PARAM"
+fi
 echo ""
 
 # Ensure log/profile directories exist (submission side)
 mkdir -p "$RUNTIME_LOG_DIR" "$NSYS_DIR" "$NCU_DIR"
+
+CONSTRAINT_SBATCH=""
+if [[ -n "$CONSTRAINT_PARAM" ]]; then
+    CONSTRAINT_SBATCH="#SBATCH --constraint=$CONSTRAINT_PARAM"
+fi
 
 # Create temporary SLURM script
 TEMP_SLURM=$(mktemp)
@@ -156,6 +169,7 @@ cat > "$TEMP_SLURM" << EOF
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:$GPUS
+$CONSTRAINT_SBATCH
 #SBATCH --time=$TIME
 #SBATCH --output=${RUNTIME_LOG_DIR}/matrix_exp_%j.out
 #SBATCH --error=${RUNTIME_LOG_DIR}/matrix_exp_%j.err
