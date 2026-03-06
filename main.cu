@@ -1330,6 +1330,13 @@ struct ArnoldiRunner {
             exit(EXIT_FAILURE);
         }
 
+        bool require_nvlink = false;
+        if (const char* env = std::getenv("REQUIRE_NVLINK")) {
+            std::string v(env);
+            require_nvlink = (v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "YES");
+        }
+        bool all_pairs_nvlink_like = true;
+
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id)); // Set device before initializing context
             device_contexts[i].init_handles();
@@ -1345,6 +1352,34 @@ struct ArnoldiRunner {
                     // Check if peer access is supported
                     int can_access;
                     cudaError_t status = cudaDeviceCanAccessPeer(&can_access, device_contexts[i].device_id, device_contexts[j].device_id);
+                    int attr_access_supported = 0;
+                    int attr_perf_rank = -1;
+                    int attr_native_atomic = 0;
+                    cudaError_t attr_status_access = cudaDeviceGetP2PAttribute(
+                        &attr_access_supported, cudaDevP2PAttrAccessSupported,
+                        device_contexts[i].device_id, device_contexts[j].device_id);
+                    cudaError_t attr_status_rank = cudaDeviceGetP2PAttribute(
+                        &attr_perf_rank, cudaDevP2PAttrPerformanceRank,
+                        device_contexts[i].device_id, device_contexts[j].device_id);
+                    cudaError_t attr_status_atomic = cudaDeviceGetP2PAttribute(
+                        &attr_native_atomic, cudaDevP2PAttrNativeAtomicSupported,
+                        device_contexts[i].device_id, device_contexts[j].device_id);
+                    bool attrs_ok = (attr_status_access == cudaSuccess &&
+                                     attr_status_rank == cudaSuccess &&
+                                     attr_status_atomic == cudaSuccess);
+                    // Heuristic: NVLink-like path usually has P2P access and either native atomics
+                    // or the best performance rank. CUDA does not expose a strict "is NVLink" flag.
+                    bool nvlink_like = (attr_access_supported == 1) &&
+                                       (attr_native_atomic == 1 || attr_perf_rank == 0);
+                    all_pairs_nvlink_like = all_pairs_nvlink_like && nvlink_like;
+                    std::cout << "[P2P] src_gpu=" << device_contexts[i].device_id
+                              << " dst_gpu=" << device_contexts[j].device_id
+                              << " can_access_peer=" << ((status == cudaSuccess && can_access) ? 1 : 0)
+                              << " attr_access_supported=" << (attrs_ok ? attr_access_supported : -1)
+                              << " perf_rank=" << (attrs_ok ? attr_perf_rank : -1)
+                              << " native_atomic=" << (attrs_ok ? attr_native_atomic : -1)
+                              << " nvlink_like=" << (nvlink_like ? 1 : 0)
+                              << std::endl;
                     if (status == cudaSuccess && can_access) {
                         // Try to enable peer access, ignore if already enabled
                         cudaError_t peer_status = cudaDeviceEnablePeerAccess(device_contexts[j].device_id, 0);
@@ -1361,6 +1396,14 @@ struct ArnoldiRunner {
                                   << device_contexts[i].device_id << " and GPU " << device_contexts[j].device_id << std::endl;
                     }
                 }
+            }
+        }
+        if (num_gpus > 1) {
+            std::cout << "[P2P] all_pairs_nvlink_like=" << (all_pairs_nvlink_like ? 1 : 0) << std::endl;
+            if (require_nvlink && !all_pairs_nvlink_like) {
+                std::cerr << "ERROR: REQUIRE_NVLINK is set, but at least one GPU pair is not NVLink-like."
+                          << " Refusing to run in fallback topology." << std::endl;
+                exit(EXIT_FAILURE);
             }
         }
     }
