@@ -29,6 +29,10 @@ M_PARAM=""
 T_PARAM=""
 MAX_RESTARTS_PARAM=""
 CONSTRAINT_PARAM=""
+PARTITION="normal"
+NSYS_NVLINK_ENABLED=0
+NSYS_GPU_METRICS_SET=""
+NSYS_GPU_METRICS_FREQ="10000"
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 # Resolve paths relative to project root (so they don't end up under build/)
 for d in LOG_ROOT RUNTIME_LOG_DIR NSYS_DIR NCU_DIR; do
@@ -83,11 +87,30 @@ if [[ $# -gt 0 && "$1" == --* ]]; then
                 CONSTRAINT_PARAM="$2"
                 shift 2
                 ;;
+            --partition)
+                PARTITION="$2"
+                shift 2
+                ;;
+            --nsys-nvlink)
+                NSYS_NVLINK_ENABLED=1
+                shift 1
+                ;;
+            --nsys-gpu-metrics-set)
+                NSYS_GPU_METRICS_SET="$2"
+                shift 2
+                ;;
+            --nsys-gpu-metrics-frequency)
+                NSYS_GPU_METRICS_FREQ="$2"
+                shift 2
+                ;;
             *)
                 echo "Unknown option: $1"
                 echo "Usage: ./launch.sh [gpus] [time] [size|matrix_file]"
-                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--constraint EXPR]"
-                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--constraint EXPR]"
+                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--partition NAME] [--constraint EXPR] [--nsys-nvlink]"
+                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--partition NAME] [--constraint EXPR] [--nsys-nvlink]"
+                echo "Optional Nsight GPU metrics tuning:"
+                echo "   --nsys-gpu-metrics-set SET"
+                echo "   --nsys-gpu-metrics-frequency HZ (10..200000, default 10000)"
                 exit 1
                 ;;
         esac
@@ -128,6 +151,7 @@ echo "Configuration:"
 echo "  GPUs: $GPUS"
 echo "  Time limit: $TIME"
 echo "  Profiler: $PROFILER"
+echo "  Partition: $PARTITION"
 if [[ -n "$MATRIX_FILE" ]]; then
     echo "  Matrix file: $MATRIX_FILE"
 else
@@ -149,6 +173,15 @@ fi
 if [[ -n "$CONSTRAINT_PARAM" ]]; then
     echo "  Constraint: $CONSTRAINT_PARAM"
 fi
+if [[ "$PROFILER" == "nsys" && "$NSYS_NVLINK_ENABLED" == "1" ]]; then
+    echo "  Nsight GPU metrics: enabled (NVLink/PCIe/DRAM/SM)"
+    echo "  Nsight GPU metrics frequency: $NSYS_GPU_METRICS_FREQ Hz"
+    if [[ -n "$NSYS_GPU_METRICS_SET" ]]; then
+        echo "  Nsight GPU metrics set: $NSYS_GPU_METRICS_SET"
+    else
+        echo "  Nsight GPU metrics set: <nsys default for selected GPUs>"
+    fi
+fi
 echo ""
 
 # Ensure log/profile directories exist (submission side)
@@ -165,7 +198,7 @@ cat > "$TEMP_SLURM" << EOF
 #!/bin/bash
 #SBATCH --job-name=matrix_exp_${JOB_TAG}_${GPUS}gpu
 #SBATCH --account=proj_1720
-#SBATCH --partition=normal
+#SBATCH --partition=$PARTITION
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:$GPUS
@@ -294,6 +327,15 @@ if [[ "$PROFILER" == "nsys" ]]; then
     echo ""
     PROFILE_OUTPUT="${NSYS_DIR}/matrix_exp_profile_\${SLURM_JOB_ID}"
     echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
+    NSYS_GPU_METRICS_ARGS=""
+    if [[ "$NSYS_NVLINK_ENABLED" == "1" ]]; then
+        NSYS_GPU_METRICS_ARGS="--gpu-metrics-devices=all --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ"
+        if [[ -n "$NSYS_GPU_METRICS_SET" ]]; then
+            NSYS_GPU_METRICS_ARGS+=" --gpu-metrics-set=$NSYS_GPU_METRICS_SET"
+        fi
+        echo "Nsight GPU metrics collection is enabled for NVLink analysis."
+        echo "Tip: if needed, inspect available sets with: \$NSYS_BIN profile --gpu-metrics-set=help"
+    fi
     # Keep trace minimal to reduce importer instability on some stacks.
     "\$NSYS_BIN" profile \\
         --output="\$PROFILE_OUTPUT" \\
@@ -301,6 +343,7 @@ if [[ "$PROFILER" == "nsys" ]]; then
         --trace=cuda,nvtx,cublas,osrt \\
         --stats=true \\
         --cuda-memory-usage=true \\
+        \$NSYS_GPU_METRICS_ARGS \\
         ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
     PROFILE_EXIT_CODE=\$?
     # Treat missing report as a profiler failure even when nsys returns 0.
