@@ -1723,43 +1723,46 @@ struct ArnoldiRunner {
         // Phase 0: start ghost exchange for q_j (double-buffered)
         ghost_exchange_qj(j);
 
-        // Phase 1: Launch on-diag SpMV on all GPUs in parallel
+        const double alpha = 1.0;
+        const double beta_on = 0.0;
+        const double beta_off = 1.0;
+
+        // Phase 1: Launch on-diag SpMV on all GPUs in parallel (cusparseSpMV)
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
 
-            double* d_qj_local = dc.d_V_m + j * dc.local_rows;
+            double* d_qj_local = dc.d_V_m + static_cast<size_t>(j) * dc.local_rows;
 
             // Zero out d_w before accumulation
             CHECK_CUDA(cudaMemsetAsync(dc.d_w, 0, sizeof(double) * dc.local_rows, dc.stream_compute));
 
-            // Custom CSR on-diag SpMV
-            int threads = 256;
-            int blocks = (dc.local_rows + threads - 1) / threads;
-            spmv_csr_on_kernel<<<blocks, threads, 0, dc.stream_compute>>>(
-                dc.d_row_ptr_on, dc.d_col_idx_on, dc.d_values_on,
-                d_qj_local, dc.d_w, dc.local_rows);
-            CHECK_CUDA(cudaGetLastError());
+            if (dc.matA_on_descr) {
+                cusparseDnVecDescr_t vec_qj_descr;
+                CHECK_CUSPARSE(cusparseCreateDnVec(&vec_qj_descr, dc.local_rows, d_qj_local, CUDA_R_64F));
+                CHECK_CUSPARSE(cusparseSpMV(dc.cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &alpha, dc.matA_on_descr, vec_qj_descr, &beta_on, dc.vec_w_descr,
+                                            CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_spmv_buffer));
+                CHECK_CUSPARSE(cusparseDestroyDnVec(vec_qj_descr));
+            }
         }
 
-        // Phase 2: Off-diag SpMV using ghost buffer, accumulate into w
+        // Phase 2: Off-diag SpMV using ghost buffer, accumulate into w (beta=1)
+        int buf_idx = j % 2;
         for (int i = 0; i < num_gpus; ++i) {
             CHECK_CUDA(cudaSetDevice(device_contexts[i].device_id));
             DeviceContext& dc = device_contexts[i];
             CSRHost::GhostMap& gm = ghost_maps[i];
             if (!dc.d_row_ptr_off || gm.total_recv_size == 0) continue;
 
-            int current_recv_buffer_idx = j % 2;
-            CHECK_CUDA(cudaStreamWaitEvent(dc.stream_compute, dc.ghost_recv_ready[current_recv_buffer_idx], 0));
+            CHECK_CUDA(cudaStreamWaitEvent(dc.stream_compute, dc.ghost_recv_ready[buf_idx], 0));
 
-            // Custom CSR off-diag SpMV accumulate into w
-            int threads = 256;
-            int blocks = (dc.local_rows + threads - 1) / threads;
-            spmv_csr_off_kernel<<<blocks, threads, 0, dc.stream_compute>>>(
-                dc.d_row_ptr_off, dc.d_col_idx_off, dc.d_values_off,
-                dc.d_ghost_recv_buffer[current_recv_buffer_idx],
-                dc.d_w, dc.local_rows);
-            CHECK_CUDA(cudaGetLastError());
+            if (dc.matA_off_descr && dc.vec_q_ghost_descr[buf_idx]) {
+                CHECK_CUSPARSE(cusparseSpMV(dc.cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &alpha, dc.matA_off_descr, dc.vec_q_ghost_descr[buf_idx],
+                                            &beta_off, dc.vec_w_descr,
+                                            CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, dc.d_spmv_buffer));
+            }
         }
     }
 
