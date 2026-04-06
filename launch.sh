@@ -226,7 +226,8 @@ echo ""
 echo "Loading modules..."
 module purge
 module load EasyBuild/modules
-module load GCC/12.3.0 CMake/3.26.3-GCCcore-12.3.0 CUDA/12.4 Eigen/3.4.0-GCCcore-12.3.0
+module load GCC/12.3.0 CMake/3.26.3-GCCcore-12.3.0 CUDA/12.4
+module --ignore-cache load Eigen/3.4.0-GCCcore-12.3.0 2>/dev/null || true
 
 # Set NCCL environment variables
 export NCCL_ROOT=/opt/software/nvidia/hpc_sdk/v24.5/Linux_x86_64/24.5/comm_libs/12.4/nccl

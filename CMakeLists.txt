@@ -46,15 +46,17 @@ target_link_libraries(matrix_exp
   Eigen3::Eigen
 )
 
-# Set CUDA properties
-# V100=70, A100=80, H100=90
-# For faster compilation during development, compile only for V100 (available on cn nodes)
-set_property(TARGET matrix_exp PROPERTY CUDA_ARCHITECTURES "70")
+# Set CUDA properties: fat binary for common datacenter GPUs (V100, A100, H100)
+# Override for faster dev builds, e.g.: cmake -DCMAKE_CUDA_ARCHITECTURES=80 ..
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "70;80;90" CACHE STRING "CUDA GPU architectures (sm_XX)")
+endif()
+set_property(TARGET matrix_exp PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 set_property(TARGET matrix_exp PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
-# Flags
+# Flags: -O3 for performance (explicit, in addition to Release defaults)
 target_compile_options(matrix_exp PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall -diag-suppress=20014>
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3 -Xcompiler=-O3 -Xcompiler=-Wall -diag-suppress=20014>
 )
 
 # Set C++ standard
@@ -66,3 +68,10 @@ set_target_properties(matrix_exp PROPERTIES
   BUILD_RPATH "${NCCL_HINT_LIB}"
   INSTALL_RPATH "${NCCL_HINT_LIB}"
 )
+
+# CPU-only reference implementation (no CUDA, no NCCL)
+add_executable(matrix_exp_cpu main_cpu.cpp)
+target_link_libraries(matrix_exp_cpu Eigen3::Eigen)
+target_compile_options(matrix_exp_cpu PRIVATE -O3)
+set_property(TARGET matrix_exp_cpu PROPERTY CXX_STANDARD 17)
+set_property(TARGET matrix_exp_cpu PROPERTY CXX_STANDARD_REQUIRED ON)
