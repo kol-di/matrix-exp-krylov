@@ -46,10 +46,12 @@ target_link_libraries(matrix_exp
   Eigen3::Eigen
 )
 
-# Set CUDA properties
-# V100=70, A100=80, H100=90
-# For faster compilation during development, compile only for V100 (available on cn nodes)
-set_property(TARGET matrix_exp PROPERTY CUDA_ARCHITECTURES "70")
+# Set CUDA properties: fat binary for common datacenter GPUs (V100, A100, H100)
+# Override for faster dev builds, e.g.: cmake -DCMAKE_CUDA_ARCHITECTURES=80 ..
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "70;80;90" CACHE STRING "CUDA GPU architectures (sm_XX)")
+endif()
+set_property(TARGET matrix_exp PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 set_property(TARGET matrix_exp PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 # Flags: -O3 for performance (explicit, in addition to Release defaults)
