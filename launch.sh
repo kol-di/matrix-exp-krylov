@@ -1,33 +1,219 @@
 #!/bin/bash
 
 # Simple Matrix Exponential Launcher Script
-# Usage: ./launch_simple.sh [gpus] [time] [size]
+# Usage: ./launch.sh [gpus] [time] [size|matrix_file]
+#   or:  ./launch.sh --size SIZE [--gpus GPUS] [--time TIME]
+#   or:  ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME]
+#
+# Examples:
+#   ./launch.sh                    # defaults: 2 GPU, 5 min, size 1000
+#   ./launch.sh 4 00:10:00 2000    # 4 GPU, 10 min, size 2000 (positional)
+#   ./launch.sh matrices/A.mtx     # load matrix file (defaults for gpus/time)
+#   ./launch.sh matrices/A.bincsr  # load Binary CSR v1 file
+#   ./launch.sh --matrix matrices/A.mtx --gpus 4 --time 00:15:00
+#   ./launch.sh --matrix matrices/A.bincsr --gpus 4 --time 00:15:00
+#   ./launch.sh --size 500         # size 500, other params default
+#   ./launch.sh --size 2000 --gpus 4 --time 00:15:00
 
 # Default values
-GPUS=${1:-2}
-TIME=${2:-"00:05:00"}
-SIZE=${3:-1000}
+GPUS=2
+TIME="00:05:00"
+SIZE=1000
+MATRIX_FILE=""
+PROFILER="nsys"  # nsys | ncu | none
+LOG_ROOT=${LOG_ROOT:-"logs"}
+RUNTIME_LOG_DIR="$LOG_ROOT/runtime"
+NSYS_DIR="$LOG_ROOT/nsys_profiles"
+NCU_DIR="$LOG_ROOT/ncu_profiles"
+M_PARAM=""
+T_PARAM=""
+MAX_RESTARTS_PARAM=""
+CONSTRAINT_PARAM=""
+PARTITION="normal"
+NSYS_NVLINK_ENABLED=0
+NSYS_GPU_METRICS_SET=""
+NSYS_GPU_METRICS_FREQ="10000"
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Resolve paths relative to project root (so they don't end up under build/)
+for d in LOG_ROOT RUNTIME_LOG_DIR NSYS_DIR NCU_DIR; do
+  val="${!d}"
+  if [[ "$val" != /* ]]; then
+    eval "$d=\"$PROJECT_ROOT/$val\""
+  fi
+done
+# Make OUTPUT_Y_FILE absolute if provided
+if [[ -n "${OUTPUT_Y_FILE-}" && "$OUTPUT_Y_FILE" != /* ]]; then
+  OUTPUT_Y_FILE="$PROJECT_ROOT/$OUTPUT_Y_FILE"
+fi
+
+# Parse arguments
+# If first argument starts with '--', use named arguments
+if [[ $# -gt 0 && "$1" == --* ]]; then
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --gpus)
+                GPUS="$2"
+                shift 2
+                ;;
+            --time)
+                TIME="$2"
+                shift 2
+                ;;
+            --size)
+                SIZE="$2"
+                shift 2
+                ;;
+            --matrix)
+                MATRIX_FILE="$2"
+                shift 2
+                ;;
+            --m)
+                M_PARAM="$2"
+                shift 2
+                ;;
+            --t)
+                T_PARAM="$2"
+                shift 2
+                ;;
+            --max-restarts)
+                MAX_RESTARTS_PARAM="$2"
+                shift 2
+                ;;
+            --profiler)
+                PROFILER="$2"
+                shift 2
+                ;;
+            --constraint)
+                CONSTRAINT_PARAM="$2"
+                shift 2
+                ;;
+            --partition)
+                PARTITION="$2"
+                shift 2
+                ;;
+            --nsys-nvlink)
+                NSYS_NVLINK_ENABLED=1
+                shift 1
+                ;;
+            --nsys-gpu-metrics-set)
+                NSYS_GPU_METRICS_SET="$2"
+                shift 2
+                ;;
+            --nsys-gpu-metrics-frequency)
+                NSYS_GPU_METRICS_FREQ="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Usage: ./launch.sh [gpus] [time] [size|matrix_file]"
+                echo "   or: ./launch.sh --size SIZE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--partition NAME] [--constraint EXPR] [--nsys-nvlink]"
+                echo "   or: ./launch.sh --matrix FILE [--gpus GPUS] [--time TIME] [--m M] [--max-restarts K] [--profiler nsys|ncu|none] [--partition NAME] [--constraint EXPR] [--nsys-nvlink]"
+                echo "Optional Nsight GPU metrics tuning:"
+                echo "   --nsys-gpu-metrics-set SET"
+                echo "   --nsys-gpu-metrics-frequency HZ (10..200000, default 10000)"
+                exit 1
+                ;;
+        esac
+    done
+else
+    # Positional arguments (old style)
+    GPUS=${1:-2}
+    TIME=${2:-"00:05:00"}
+    THIRD=${3:-""}
+    if [[ -n "$THIRD" ]]; then
+        if [[ "$THIRD" == *.* || "$THIRD" == */* || "$THIRD" == *.mtx ]]; then
+            MATRIX_FILE="$THIRD"
+        else
+            SIZE="$THIRD"
+        fi
+    fi
+    # Optional 4th and 5th positional for m and max_restarts (matching main)
+    if [[ -n "${4-}" ]]; then
+        M_PARAM="$4"
+    fi
+    if [[ -n "${5-}" ]]; then
+        MAX_RESTARTS_PARAM="$5"
+    fi
+fi
+
+# Decide what to pass to the executable
+RUN_ARG="$SIZE"
+JOB_TAG="size${SIZE}"
+if [[ -n "$MATRIX_FILE" ]]; then
+    RUN_ARG="$MATRIX_FILE"
+    JOB_TAG=$(basename "$MATRIX_FILE")
+    # sanitize job tag (remove slashes/spaces)
+    JOB_TAG=${JOB_TAG//[^A-Za-z0-9._-]/_}
+fi
 
 echo "=== Simple Matrix Exponential Job Launcher ==="
 echo "Configuration:"
 echo "  GPUs: $GPUS"
 echo "  Time limit: $TIME"
-echo "  Matrix size: $SIZE"
+echo "  Profiler: $PROFILER"
+echo "  Partition: $PARTITION"
+if [[ -n "$MATRIX_FILE" ]]; then
+    echo "  Matrix file: $MATRIX_FILE"
+else
+    echo "  Matrix size: $SIZE"
+fi
+echo "  Logs dir: $LOG_ROOT"
+echo "  Runtime logs: $RUNTIME_LOG_DIR"
+echo "  Nsight Systems dir: $NSYS_DIR"
+echo "  Nsight Compute dir: $NCU_DIR"
+if [[ -n "$M_PARAM" ]]; then
+    echo "  Arnoldi m: $M_PARAM"
+fi
+if [[ -n "$T_PARAM" ]]; then
+    echo "  Time parameter t: $T_PARAM"
+fi
+if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
+    echo "  Max restarts: $MAX_RESTARTS_PARAM (<=0 means until convergence)"
+fi
+if [[ -n "$CONSTRAINT_PARAM" ]]; then
+    echo "  Constraint: $CONSTRAINT_PARAM"
+fi
+if [[ "$PROFILER" == "nsys" && "$NSYS_NVLINK_ENABLED" == "1" ]]; then
+    echo "  Nsight GPU metrics: enabled (NVLink/PCIe/DRAM/SM)"
+    echo "  Nsight GPU metrics frequency: $NSYS_GPU_METRICS_FREQ Hz"
+    if [[ -n "$NSYS_GPU_METRICS_SET" ]]; then
+        echo "  Nsight GPU metrics set: $NSYS_GPU_METRICS_SET"
+    else
+        echo "  Nsight GPU metrics set: <nsys default for selected GPUs>"
+    fi
+fi
 echo ""
+
+# Ensure log/profile directories exist (submission side)
+mkdir -p "$RUNTIME_LOG_DIR" "$NSYS_DIR" "$NCU_DIR"
+
+CONSTRAINT_SBATCH=""
+if [[ -n "$CONSTRAINT_PARAM" ]]; then
+    CONSTRAINT_SBATCH="#SBATCH --constraint=$CONSTRAINT_PARAM"
+fi
 
 # Create temporary SLURM script
 TEMP_SLURM=$(mktemp)
 cat > "$TEMP_SLURM" << EOF
 #!/bin/bash
-#SBATCH --job-name=matrix_exp_${SIZE}_${GPUS}gpu
+#SBATCH --job-name=matrix_exp_${JOB_TAG}_${GPUS}gpu
 #SBATCH --account=proj_1720
-#SBATCH --partition=normal
+#SBATCH --partition=$PARTITION
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:$GPUS
+$CONSTRAINT_SBATCH
 #SBATCH --time=$TIME
-#SBATCH --output=matrix_exp_%j.out
-#SBATCH --error=matrix_exp_%j.err
+#SBATCH --output=${RUNTIME_LOG_DIR}/matrix_exp_%j.out
+#SBATCH --error=${RUNTIME_LOG_DIR}/matrix_exp_%j.err
+#SBATCH --export=ALL
+
+# Propagate OUTPUT_Y_FILE only when non-empty
+if [[ -n "${OUTPUT_Y_FILE-}" ]]; then
+  export OUTPUT_Y_FILE
+else
+  unset OUTPUT_Y_FILE
+fi
 
 echo "=== Matrix Exponential SLURM Job ==="
 echo "Job ID: \$SLURM_JOB_ID"
@@ -70,24 +256,142 @@ if [ ! -f "./build/matrix_exp" ]; then
     fi
 fi
 
-echo "Running matrix exponential computation..."
+echo "Running matrix exponential computation with profiler: $PROFILER"
+if [[ -n "$MATRIX_FILE" ]]; then
+echo "Matrix file: $MATRIX_FILE"
+else
 echo "Matrix size: $SIZE"
+fi
 echo ""
 
-# Run the program
+# Prepare matrix file if provided.
+# For MatrixMarket .gz, decompress to a temporary .mtx.
+# For Binary CSR (.bincsr), pass through as-is.
+ACTUAL_ARG="$RUN_ARG"
+TEMP_MATRIX=""
+if [[ -n "$MATRIX_FILE" ]]; then
+    if [[ ! -f "$MATRIX_FILE" ]]; then
+        echo "ERROR: Matrix file not found: $MATRIX_FILE"
+        exit 1
+    fi
+    if [[ "$MATRIX_FILE" == *.gz ]]; then
+        TEMP_MATRIX="/tmp/matrix_\${SLURM_JOB_ID}.mtx"
+        echo "Decompressing matrix to \$TEMP_MATRIX ..."
+        gzip -dc "$MATRIX_FILE" > "\$TEMP_MATRIX"
+        if [[ \$? -ne 0 ]]; then
+            echo "ERROR: Failed to decompress $MATRIX_FILE"
+            exit 1
+        fi
+        ACTUAL_ARG="\$TEMP_MATRIX"
+    fi
+fi
+
+# Run the program with nsys profiling
 cd build
-./matrix_exp
+PROFILE_EXIT_CODE=0
+
+# Build extra args for Arnoldi params
+EXTRA_ARGS=""
+if [[ -n "$M_PARAM" ]]; then
+    EXTRA_ARGS+=" --m $M_PARAM"
+fi
+if [[ -n "$T_PARAM" ]]; then
+    EXTRA_ARGS+=" --t $T_PARAM"
+fi
+if [[ -n "$MAX_RESTARTS_PARAM" ]]; then
+    EXTRA_ARGS+=" --max-restarts $MAX_RESTARTS_PARAM"
+fi
+
+if [[ "$PROFILER" == "nsys" ]]; then
+    # Prefer newer Nsight Systems from NVIDIA HPC SDK, fallback to module-provided nsys.
+    NSYS_BIN=""
+    for cand in \
+        /opt/software/nvidia/hpc_sdk/v24.11/Linux_x86_64/24.11/profilers/Nsight_Systems/bin/nsys \
+        /opt/software/nvidia/hpc_sdk/v24.11/Linux_x86_64/2024/profilers/Nsight_Systems/bin/nsys \
+        /opt/software/nvidia/hpc_sdk/v24.5/Linux_x86_64/24.5/profilers/Nsight_Systems/bin/nsys \
+        /opt/software/nvidia/hpc_sdk/v24.5/Linux_x86_64/2024/profilers/Nsight_Systems/bin/nsys; do
+        if [[ -x "\$cand" ]]; then
+            NSYS_BIN="\$cand"
+            break
+        fi
+    done
+    if [[ -z "\$NSYS_BIN" ]]; then
+        NSYS_BIN="\$(command -v nsys || true)"
+    fi
+    if [[ -z "\$NSYS_BIN" ]]; then
+        echo "ERROR: nsys not found. Make sure CUDA module is loaded."
+        exit 1
+    fi
+    echo "Nsight Systems version:"
+    "\$NSYS_BIN" --version
+    echo ""
+    PROFILE_OUTPUT="${NSYS_DIR}/matrix_exp_profile_\${SLURM_JOB_ID}"
+    echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.nsys-rep"
+    NSYS_GPU_METRICS_ARGS=""
+    if [[ "$NSYS_NVLINK_ENABLED" == "1" ]]; then
+        NSYS_GPU_METRICS_ARGS="--gpu-metrics-devices=all --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ"
+        if [[ -n "$NSYS_GPU_METRICS_SET" ]]; then
+            NSYS_GPU_METRICS_ARGS+=" --gpu-metrics-set=$NSYS_GPU_METRICS_SET"
+        fi
+        echo "Nsight GPU metrics collection is enabled for NVLink analysis."
+        echo "Tip: if needed, inspect available sets with: \$NSYS_BIN profile --gpu-metrics-set=help"
+    fi
+    # Keep trace minimal to reduce importer instability on some stacks.
+    "\$NSYS_BIN" profile \\
+        --output="\$PROFILE_OUTPUT" \\
+        --force-overwrite=true \\
+        --trace=cuda,nvtx,cublas,osrt \\
+        --stats=true \\
+        --cuda-memory-usage=true \\
+        \$NSYS_GPU_METRICS_ARGS \\
+        ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
+    PROFILE_EXIT_CODE=\$?
+    # Treat missing report as a profiler failure even when nsys returns 0.
+    if [[ \$PROFILE_EXIT_CODE -eq 0 && ! -f "\${PROFILE_OUTPUT}.nsys-rep" ]]; then
+        echo "ERROR: nsys finished but did not produce \${PROFILE_OUTPUT}.nsys-rep"
+        PROFILE_EXIT_CODE=2
+    fi
+elif [[ "$PROFILER" == "ncu" ]]; then
+    # Check ncu
+    if ! command -v ncu &> /dev/null; then
+        echo "ERROR: ncu not found. Make sure CUDA module is loaded."
+        exit 1
+    fi
+    echo "Nsight Compute version:"
+    ncu --version
+    echo ""
+    PROFILE_OUTPUT="${NCU_DIR}/matrix_exp_profile_\${SLURM_JOB_ID}"
+    echo "Profiling output will be saved to: \${PROFILE_OUTPUT}.ncu-rep"
+    # Focus on kernels inside NVTX range total_compute_expmv and collect flop-related metrics
+    ncu \\
+        --target-processes all \\
+        --nvtx \\
+        --metrics \"sm__sass_thread_inst_executed_ops_fadd_pred_on.sum,sm__sass_thread_inst_executed_ops_ffma_pred_on.sum,sm__sass_thread_inst_executed_ops_fmul_pred_on.sum,sm__sass_thread_inst_executed_ops_dadd_pred_on.sum,sm__sass_thread_inst_executed_ops_dfma_pred_on.sum,sm__sass_thread_inst_executed_ops_dmul_pred_on.sum\" \\
+        --export \"\$PROFILE_OUTPUT\" \\
+        ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
+    PROFILE_EXIT_CODE=\$?
+else
+    echo "Profiler disabled; running binary directly."
+    ./matrix_exp "\$ACTUAL_ARG" \$EXTRA_ARGS
+    PROFILE_EXIT_CODE=\$?
+fi
 
 # Check exit status
-if [ \$? -eq 0 ]; then
+if [ \$PROFILE_EXIT_CODE -eq 0 ]; then
     echo ""
     echo "=== Job completed successfully ==="
+    if [ -f "\${PROFILE_OUTPUT}.nsys-rep" ]; then
+        echo "Profile report saved: \${PROFILE_OUTPUT}.nsys-rep"
+        echo "To view the report, use: nsys-ui \${PROFILE_OUTPUT}.nsys-rep"
+        echo "Or generate a report: nsys stats \${PROFILE_OUTPUT}.nsys-rep"
+    fi
 else
     echo ""
-    echo "=== Job failed with exit code \$? ==="
+    echo "=== Job failed with exit code \$PROFILE_EXIT_CODE ==="
 fi
 
 echo "End time: \$(date)"
+exit \$PROFILE_EXIT_CODE
 EOF
 
 # Submit the job
@@ -97,6 +401,7 @@ echo "Job submitted with ID: $JOB_ID"
 echo ""
 
 # Clean up temporary file
+cp "$TEMP_SLURM" "$PROJECT_ROOT/last_sbatch.sh"
 rm "$TEMP_SLURM"
 
 # Show job status
